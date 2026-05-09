@@ -86,3 +86,75 @@ The rollout script seeds the robot from episode 0 of the training dataset before
 ```powershell
 --training_dataset_repo_id=<hf_user>/so101_blind_task2_progress_v1
 ```
+
+## 6. Keyboard Hover Controller
+
+The hover controller is the first non-contact bridge from Atakan's vision sandbox to the SO-101.
+It does not press keys.
+
+Inputs:
+
+- accepted target-map JSON from `atakan-code`
+- local Roboflow inference server for live wrist frames
+- visible end effector in the wrist image
+- SO-101 follower, wrist camera, and URDF path
+
+Dry-run validation:
+
+```powershell
+python scripts/project4/keyboard_hover_controller.py `
+  --dry-run `
+  --target-map ..\atakan-code\outputs\target_map.json `
+  --target-key h
+```
+
+Real hover run:
+
+```powershell
+python scripts/project4/keyboard_hover_controller.py `
+  --target-map ..\atakan-code\outputs\target_map.json `
+  --target-key h `
+  --atakan-code-dir ..\atakan-code `
+  --env-file ..\atakan-code\.env.inference `
+  --robot-port COM_FOLLOWER `
+  --robot-id so101_keyboard_follower `
+  --camera-index 0 `
+  --urdf-path path\to\so101_new_calib.urdf
+```
+
+The controller repeatedly detects the requested key and visible tip in the current wrist frame, estimates a local image-servo Jacobian from small lateral nudges, and stops once the tip-target pixel error is within `15 px` for three consecutive frames.
+
+## 7. One-Command Handoff Setup
+
+For Arda, run this from `arda-code` in PowerShell:
+
+```powershell
+.\scripts\project4\setup_keyboard_hover.ps1
+```
+
+Default inputs:
+
+- sibling `..\atakan-code`
+- Atakan branch `samuel`
+- Arda branch `samuel-keyboard-hover`
+- Python command `python`
+- target key `h`
+- generated fixture target map for dry-run validation
+
+Default outputs:
+
+- `..\atakan-code\outputs\setup_visual_servo_smoke.json`
+- `outputs\setup_fixture_target_map.json`
+- `outputs\setup_keyboard_hover_dry_run\hover_report.json`
+
+Useful options:
+
+```powershell
+.\scripts\project4\setup_keyboard_hover.ps1 `
+  -Python py `
+  -TargetKey h `
+  -StartInferenceServer `
+  -RunLiveDetection
+```
+
+The default setup does not move the robot and does not require Roboflow to be running. It installs dependencies, runs Atakan unit tests, runs visual-servo simulation, checks the hover controller CLI, and validates an Arda dry-run target map.
