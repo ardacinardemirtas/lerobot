@@ -1,0 +1,3 @@
+[submodule "keyboard_detection"]
+	path = keyboard_detection
+	url = https://github.com/atakan-topaloglu/keyboard_detection.git
