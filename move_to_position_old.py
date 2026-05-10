@@ -170,8 +170,8 @@ def _clamp_target(target: np.ndarray, current: np.ndarray) -> np.ndarray:
 # PID gains for the Cartesian settle loop.
 # Start with KI=0, KD=0 and raise KP until sustained oscillation for Z-N tuning.
 KP = 1.0    # proportional
-KI = 5.0    # integral — eliminates steady-state error from friction/deadband
-KD = 0.0    # derivative — damps oscillation
+KI = 4.0    # integral — eliminates steady-state error from friction/deadband
+KD = 0.5    # derivative — damps oscillation
 
 SETTLE_THRESHOLD_M = 0.003   # stop when FK error < 3 mm
 SETTLE_MAX_ITER    = 60      # safety cap (~2 s at 30 Hz)

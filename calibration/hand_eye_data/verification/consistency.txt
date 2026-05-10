@@ -1,0 +1,84 @@
+Hand-Eye Calibration Verification Report
+============================================================
+
+Loaded T_ee_cam from: C:\Users\plata\robots\lerobot\calibration\hand_eye_data\hand_eye_result.npz
+
+T_ee_cam (4x4):
+  [-0.99897232  0.0039675   0.04515045 -0.00605807]
+  [-0.02221428 -0.91116931 -0.41143288  0.06894898]
+  [ 0.03950735 -0.41201305  0.91032105 -0.0578237 ]
+  [0. 0. 0. 1.]
+
+============================================================
+TEST 2 -- Board position consistency
+============================================================
+  Mean board origin (base frame): (+0.3537, +0.1435, -0.0207) m
+  StdDev:                         (+0.0057, +0.0020, +0.0024) m
+  RMS deviation:                  0.65 cm
+
+  [calib_0001]  board_origin=(+0.3486,+0.1402,-0.0219)m  dev=0.62cm
+  [calib_0002]  board_origin=(+0.3498,+0.1394,-0.0225)m  dev=0.59cm
+  [calib_0003]  board_origin=(+0.3526,+0.1433,-0.0218)m  dev=0.16cm
+  [calib_0004]  board_origin=(+0.3508,+0.1437,-0.0210)m  dev=0.30cm
+  [calib_0005]  board_origin=(+0.3483,+0.1431,-0.0230)m  dev=0.59cm
+  [calib_0006]  board_origin=(+0.3641,+0.1436,-0.0178)m  dev=1.08cm
+  [calib_0007]  board_origin=(+0.3623,+0.1466,-0.0186)m  dev=0.93cm
+  [calib_0008]  board_origin=(+0.3563,+0.1429,-0.0221)m  dev=0.30cm
+  [calib_0009]  board_origin=(+0.3560,+0.1428,-0.0211)m  dev=0.24cm
+  [calib_0010]  board_origin=(+0.3562,+0.1432,-0.0170)m  dev=0.45cm
+  [calib_0011]  board_origin=(+0.3572,+0.1442,-0.0208)m  dev=0.36cm
+  [calib_0012]  board_origin=(+0.3571,+0.1416,-0.0201)m  dev=0.40cm
+  [calib_0013]  board_origin=(+0.3551,+0.1425,-0.0215)m  dev=0.19cm
+  [calib_0014]  board_origin=(+0.3627,+0.1455,-0.0158)m  dev=1.04cm
+  [calib_0015]  board_origin=(+0.3568,+0.1449,-0.0188)m  dev=0.39cm
+  [calib_0016]  board_origin=(+0.3492,+0.1435,-0.0220)m  dev=0.47cm
+  [calib_0017]  board_origin=(+0.3497,+0.1448,-0.0218)m  dev=0.43cm
+  [calib_0018]  board_origin=(+0.3494,+0.1446,-0.0224)m  dev=0.48cm
+  [calib_0019]  board_origin=(+0.3501,+0.1462,-0.0210)m  dev=0.45cm
+  [calib_0020]  board_origin=(+0.3539,+0.1460,-0.0183)m  dev=0.35cm
+  [calib_0021]  board_origin=(+0.3564,+0.1429,-0.0209)m  dev=0.27cm
+  [calib_0022]  board_origin=(+0.3485,+0.1404,-0.0216)m  dev=0.61cm
+  [calib_0023]  board_origin=(+0.3481,+0.1421,-0.0214)m  dev=0.58cm
+  [calib_0024]  board_origin=(+0.3585,+0.1420,-0.0182)m  dev=0.56cm
+  [calib_0025]  board_origin=(+0.3624,+0.1420,-0.0166)m  dev=0.97cm
+  [calib_0026]  board_origin=(+0.3611,+0.1484,-0.0184)m  dev=0.92cm
+  [calib_0027]  board_origin=(+0.3575,+0.1453,-0.0198)m  dev=0.43cm
+  [calib_0028]  board_origin=(+0.3440,+0.1427,-0.0252)m  dev=1.08cm
+  [calib_0029]  board_origin=(+0.3443,+0.1460,-0.0249)m  dev=1.06cm
+  [calib_0030]  board_origin=(+0.3447,+0.1406,-0.0253)m  dev=1.05cm
+
+============================================================
+TEST 3 -- Reprojection via T_ee_cam
+============================================================
+  Mean prediction reprojection error: 6.709 px
+
+  [calib_0001]  detect=0.124px  predict=10.349px
+  [calib_0002]  detect=0.155px  predict=7.192px
+  [calib_0003]  detect=0.138px  predict=1.953px
+  [calib_0004]  detect=0.120px  predict=4.449px
+  [calib_0005]  detect=0.469px  predict=9.021px
+  [calib_0006]  detect=0.085px  predict=9.139px
+  [calib_0007]  detect=0.095px  predict=8.376px
+  [calib_0008]  detect=0.131px  predict=2.589px
+  [calib_0009]  detect=0.159px  predict=3.304px
+  [calib_0010]  detect=0.522px  predict=3.754px
+  [calib_0011]  detect=0.164px  predict=3.913px
+  [calib_0012]  detect=0.245px  predict=3.328px
+  [calib_0013]  detect=0.266px  predict=1.417px
+  [calib_0014]  detect=0.101px  predict=8.298px
+  [calib_0015]  detect=0.126px  predict=4.162px
+  [calib_0016]  detect=0.130px  predict=5.564px
+  [calib_0017]  detect=0.101px  predict=3.614px
+  [calib_0018]  detect=0.155px  predict=4.406px
+  [calib_0019]  detect=0.125px  predict=4.381px
+  [calib_0020]  detect=0.166px  predict=4.065px
+  [calib_0021]  detect=0.162px  predict=3.867px
+  [calib_0022]  detect=0.149px  predict=11.746px
+  [calib_0023]  detect=0.188px  predict=11.612px
+  [calib_0024]  detect=0.116px  predict=5.423px
+  [calib_0025]  detect=0.110px  predict=7.653px
+  [calib_0026]  detect=0.112px  predict=8.049px
+  [calib_0027]  detect=0.255px  predict=4.867px
+  [calib_0028]  detect=0.121px  predict=14.684px
+  [calib_0029]  detect=0.161px  predict=15.424px
+  [calib_0030]  detect=0.107px  predict=14.659px

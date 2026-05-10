@@ -51,32 +51,26 @@ CAMERA_INDEX  = 1
 CAMERA_WIDTH  = 640
 CAMERA_HEIGHT = 480
 
-# Original calibration was at 1920×1080.
-# Camera crops 1920→1440 (center, 4:3) then scales 1440×1080→640×480.
-# Uniform scale = 640/1440 = 4/9.  cx offset = (1920−1440)/2 = 240 px before scaling.
-_s   = 640 / 1440          # = 4/9 ≈ 0.4444  (uniform for both axes)
-_cx0 = 981.92182023 - 240  # subtract half-crop before scaling
+#calibration at 640x480
 CAMERA_K = np.array([
-    [693.35550704 * _s,  0.0,                 _cx0              * _s],
-    [0.0,                692.62105461 * _s,   496.33606080      * _s],
-    [0.0,                0.0,                 1.0                   ],
+    [341.4095, 0.0000, 329.1160],
+    [0.0000, 340.6890, 219.6222],
+    [0.0000, 0.0000, 1.0000],
 ], dtype=float)
 # Distortion coefficients are dimensionless — stay the same across resolutions
 DIST_COEFFS = np.array(
-    [0.06046540, -0.07201475, -0.00076385, 0.00059471, -0.00305710],
+    [0.0799172, -0.15934891, -0.00045079, -0.00048855, 0.11357439],
     dtype=float,
 )
 
 # Hand-eye: 4×4 transform from camera frame → end-effector frame (P_ee = T_EE_CAM @ P_cam)
-_R_cam_in_ee = np.array([
-    [-0.99926494,  0.01263551,  0.03619287],
-    [-0.02597731, -0.91749060, -0.39690828],
-    [ 0.02819148, -0.39755672,  0.91714442],
+# Ground truth — verified independently by two solvers (PARK/HORAUD/DANIILIDIS + external).
+T_EE_CAM = np.array([
+    [-0.998972,  0.003967,  0.045150, -0.006058],
+    [-0.022214, -0.911169, -0.411433,  0.068949],
+    [ 0.039507, -0.412013,  0.910321, -0.057824],
+    [ 0.000000,  0.000000,  0.000000,  1.000000],
 ], dtype=float)
-_t_cam_in_ee = np.array([0.00348327, 0.08292417, -0.08243772], dtype=float)
-T_EE_CAM = np.eye(4, dtype=float)
-T_EE_CAM[:3, :3] = _R_cam_in_ee
-T_EE_CAM[:3,  3] = _t_cam_in_ee
 
 # Height of the work surface in robot base frame — table is at z = 0
 TARGET_Z_M = 0
@@ -89,12 +83,11 @@ HOME_DEG = np.array([-1.2308, -99.5604, 97.8901, 34.4615, -89.6264, 99.8606])
 # ── smooth_move / settle parameters (from move_to_position_old.py) ────────────
 KP = 1.0       # proportional
 KI = 5.0       # integral — eliminates steady-state error
-KD = 0.0       # derivative
+KD = 0.5       # derivative
 SETTLE_THRESHOLD_M = 0.003
 SETTLE_MAX_ITER    = 60
 D_ALPHA            = 0.3   # derivative low-pass filter coefficient
 SMOOTH_DURATION_S  = 2.0   # interpolation duration for smooth_move
-SMOOTH_HZ          = 60    # command rate during trajectory streaming
 
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -254,13 +247,11 @@ def smooth_move(
 ) -> str:
     """
     Smoothstep Cartesian interpolation to target_pos, then PID settle.
-    IK is pre-computed for all waypoints so the streaming loop has no solver
-    latency — this keeps the command rate steady and prevents the servo from
-    parking at each waypoint before the next command arrives.
+    Orientation is held constant throughout.
     Returns 'done', 'cancelled', or 'max_iter'.
     """
-    obs     = robot.get_observation()
-    q       = _joints_from_obs(obs)
+    obs    = robot.get_observation()
+    q      = _joints_from_obs(obs)
     T_start = kin.forward_kinematics(q)
     p_start = T_start[:3, 3].copy()
     gripper = obs["gripper.pos"]
@@ -273,33 +264,35 @@ def smooth_move(
     T_target = T_start.copy()
     T_target[:3, 3] = target_pos
 
-    n_steps = max(int(duration_s * SMOOTH_HZ), 1)
+    n_steps = max(int(duration_s * FPS), 1)
 
-    # Pre-compute all IK solutions so the streaming loop is latency-free.
-    waypoint_joints: list[np.ndarray] = []
-    q_wp = q.copy()
     for i in range(1, n_steps + 1):
-        alpha = i / n_steps
-        alpha = alpha * alpha * (3.0 - 2.0 * alpha)   # smoothstep easing
-        T_wp = T_start.copy()
-        T_wp[:3, 3] = (1.0 - alpha) * p_start + alpha * target_pos
-        q_wp = kin.inverse_kinematics(q_wp, T_wp)
-        waypoint_joints.append(q_wp.copy())
-
-    dt = 1.0 / SMOOTH_HZ
-    for q_cmd in waypoint_joints:
         if stop_event.is_set():
             return "cancelled"
+
         t0 = time.perf_counter()
-        action = {f"{n}.pos": float(q_cmd[j]) for j, n in enumerate(MOTOR_NAMES) if n != "gripper"}
+
+        alpha = i / n_steps
+        alpha = alpha * alpha * (3.0 - 2.0 * alpha)   # smoothstep easing
+
+        T_wp = T_start.copy()
+        T_wp[:3, 3] = (1.0 - alpha) * p_start + alpha * target_pos
+        q = kin.inverse_kinematics(q, T_wp)
+
+        action = {f"{n}.pos": float(q[j]) for j, n in enumerate(MOTOR_NAMES) if n != "gripper"}
         action["gripper.pos"] = gripper
         robot.send_action(action)
-        time.sleep(max(dt - (time.perf_counter() - t0), 0.0))
+
+        time.sleep(max(1.0 / FPS - (time.perf_counter() - t0), 0.0))
 
     return settle(robot, kin, target_pos, T_target, stop_event, pid_enabled)
 
 
 # ─── Coordinate mapping ───────────────────────────────────────────────────────
+
+# Set to True to print full intermediate values on every click — for calibration debugging.
+DEBUG_PROJECTION = True
+
 
 def pixel_to_robot_target(
     u: float,
@@ -329,14 +322,71 @@ def pixel_to_robot_target(
     origin = T_base_cam[:3, 3]
     d_base = R @ d_cam
 
+    if DEBUG_PROJECTION:
+        import math
+        d_cam_n  = d_cam / np.linalg.norm(d_cam)
+        obliquity = math.acos(abs(d_cam_n[2])) * 180.0 / math.pi
+        print("\n─── pixel_to_robot_target diagnostics ───")
+        print(f"  pixel         : ({u}, {v})  undistorted: ({u_u:.2f}, {v_u:.2f})")
+        print(f"  d_cam (norm)  : ({d_cam_n[0]:+.4f}, {d_cam_n[1]:+.4f}, {d_cam_n[2]:+.4f})"
+              f"  obliquity={obliquity:.1f}°")
+        print(f"  cam origin    : ({origin[0]:+.4f}, {origin[1]:+.4f}, {origin[2]:+.4f})")
+        print(f"  d_base        : ({d_base[0]:+.4f}, {d_base[1]:+.4f}, {d_base[2]:+.4f})")
+
     if abs(d_base[2]) < 1e-6:
-        return None   # ray parallel to work-surface plane
+        if DEBUG_PROJECTION:
+            print("  → ray parallel to work-surface plane (d_base[2] ≈ 0)")
+        return None
 
     t = (z_target - origin[2]) / d_base[2]
-    if t < 0:
-        return None   # intersection behind camera
 
-    return origin + t * d_base
+    if DEBUG_PROJECTION:
+        print(f"  ray param t   : {t:.4f}  (camera ht above plane = {origin[2]:.4f} m)")
+
+    if t < 0:
+        if DEBUG_PROJECTION:
+            print("  → intersection behind camera (t < 0) — check T_EE_CAM or TARGET_Z_M")
+        return None
+
+    result = origin + t * d_base
+    if DEBUG_PROJECTION:
+        print(f"  result (base) : ({result[0]:+.4f}, {result[1]:+.4f}, {result[2]:+.4f})")
+    return result
+
+
+def reproject_ground_grid(
+    T_base_cam: np.ndarray,
+    K: np.ndarray,
+    z_target: float,
+    frame: np.ndarray,
+    grid_step_m: float = 0.05,
+) -> np.ndarray:
+    """
+    Overlay a grid of known ground-plane points (robot base frame, z=z_target)
+    as reprojected dots on the frame.  Use this to visually verify T_base_cam.
+    Press 'g' in the GUI to toggle it.
+    """
+    h, w = frame.shape[:2]
+    fx, fy = K[0, 0], K[1, 1]
+    cx, cy = K[0, 2], K[1, 2]
+
+    T_cam_base = np.linalg.inv(T_base_cam)
+
+    for x_m in np.arange(-0.30, 0.31, grid_step_m):
+        for y_m in np.arange(-0.30, 0.31, grid_step_m):
+            P_base = np.array([x_m, y_m, z_target, 1.0])
+            P_cam  = T_cam_base @ P_base
+            if P_cam[2] <= 0:
+                continue
+            u = fx * P_cam[0] / P_cam[2] + cx
+            v = fy * P_cam[1] / P_cam[2] + cy
+            if 0 <= u < w and 0 <= v < h:
+                pu, pv = int(round(u)), int(round(v))
+                cv2.circle(frame, (pu, pv), 3, (0, 255, 255), -1)
+                label = f"{x_m:.0f},{y_m:.0f}"
+                cv2.putText(frame, label, (pu + 4, pv - 4),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.28, (0, 220, 220), 1)
+    return frame
 
 
 # ─── GUI ──────────────────────────────────────────────────────────────────────
@@ -349,7 +399,9 @@ _HELP = [
     "Space             jog +Z by 0.02 m (up)",
     "r / HOME key      return to home position",
     "p                 toggle PID in the settle loop",
-    "s                 print EE position to terminal",
+    "s                 print EE position (touch table first → verify z ≈ TARGET_Z_M)",
+    "g                 toggle reprojection grid overlay (calibration debug)",
+    "d                 toggle per-click projection diagnostics in terminal",
     "h                 toggle this help",
     "q / Esc           return home and quit",
 ]
@@ -380,9 +432,11 @@ class ClickToMoveApp:
 
         self._pid       = False
         self._help      = False
+        self._grid      = False   # reprojection overlay (debug)
         self._status    = "Ready — left-click to move  |  arrows to jog  |  r = home"
         self._click_uv:  Optional[tuple[int, int]] = None
         self._target_3d: Optional[np.ndarray]      = None
+        self._T_base_cam_last: Optional[np.ndarray] = None   # cached for grid overlay
 
         self._stop   = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -395,7 +449,9 @@ class ClickToMoveApp:
         obs = self.robot.get_observation()
         q   = _joints_from_obs(obs)
         T_base_ee = self.kin.forward_kinematics(q)
-        return T_base_ee @ T_EE_CAM
+        T = T_base_ee @ T_EE_CAM
+        self._T_base_cam_last = T
+        return T
 
     # ── mouse callback ────────────────────────────────────────────────────────
 
@@ -513,10 +569,19 @@ class ClickToMoveApp:
         cv2.putText(frame, self._status, (8, h - bar_h + 20),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.50, (255, 255, 255), 1, cv2.LINE_AA)
 
+        debug_flag = "DBG " if DEBUG_PROJECTION else ""
+        grid_flag  = "GRID " if self._grid else ""
         info = (f"PID: {'ON' if self._pid else 'OFF'}  |  Z={TARGET_Z_M:.2f}m  |  "
-                f"arrows=jog  space=up  r=home  h=help  q=quit")
+                f"{debug_flag}{grid_flag}arrows=jog  space=up  r=home  g=grid  d=dbg  h=help  q=quit")
         cv2.putText(frame, info, (8, h - bar_h + 44),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.38, (160, 220, 160), 1, cv2.LINE_AA)
+
+        # ── Reprojection grid overlay (calibration debug) ─────────────────────
+        if self._grid and self._T_base_cam_last is not None:
+            try:
+                reproject_ground_grid(self._T_base_cam_last, CAMERA_K, TARGET_Z_M, frame)
+            except Exception:
+                pass
 
         # ── Click crosshair ───────────────────────────────────────────────────
         if self._click_uv is not None:
@@ -601,7 +666,25 @@ class ClickToMoveApp:
                 q   = _joints_from_obs(obs)
                 T   = self.kin.forward_kinematics(q)
                 p   = T[:3, 3]
-                print(f"EE  x={p[0]:+.4f}  y={p[1]:+.4f}  z={p[2]:+.4f}")
+                print(f"EE  x={p[0]:+.4f}  y={p[1]:+.4f}  z={p[2]:+.4f}"
+                      f"  (TARGET_Z_M={TARGET_Z_M:.4f} — should match when touching table)")
+                # Also refresh cached T_base_cam for grid overlay
+                try:
+                    self._T_base_cam_last = T @ T_EE_CAM
+                except Exception:
+                    pass
+            elif key & 0xFF == ord("g"):
+                self._grid = not self._grid
+                if self._grid and self._T_base_cam_last is None:
+                    try:
+                        self._T_base_cam_last = self._T_base_cam()
+                    except Exception:
+                        pass
+                self._status = f"Grid overlay {'ON' if self._grid else 'OFF'} — yellow dots = ground plane at Z={TARGET_Z_M:.2f}m"
+            elif key & 0xFF == ord("d"):
+                global DEBUG_PROJECTION
+                DEBUG_PROJECTION = not DEBUG_PROJECTION
+                self._status = f"Click diagnostics {'ON' if DEBUG_PROJECTION else 'OFF'}"
 
         self._stop.set()
         if self._thread is not None:
@@ -626,6 +709,11 @@ def main() -> None:
     # Home position derived from hardcoded HOME_DEG — same across all runs
     home = kin.forward_kinematics(HOME_DEG)[:3, 3].copy()
     print(f"Home: x={home[0]:+.4f}  y={home[1]:+.4f}  z={home[2]:+.4f}")
+
+    print("Moving to home position …")
+    stop_dummy = threading.Event()
+    smooth_move(robot, kin, home, stop_dummy, pid_enabled=False)
+    print("At home.\n")
 
     cap = cv2.VideoCapture(CAMERA_INDEX)
     if cap.isOpened():
