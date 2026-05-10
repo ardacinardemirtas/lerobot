@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """
 Interactive end-effector controller for SO-101.
-Uses ikpy for FK/IK — pure Python, works on Windows natively.
+Uses ikpy for FK only — IK replaced by Jacobian pseudoinverse controller.
 
 Install dependency:  pip install ikpy
 
@@ -143,8 +143,11 @@ def _joints_from_obs(obs: dict) -> np.ndarray:
 
 
 def _print_ee(T: np.ndarray, prefix: str = ""):
-    p = T[:3, 3]
-    print(f"{prefix}EE → x={p[0]:+.4f}m  y={p[1]:+.4f}m  z={p[2]:+.4f}m")
+    R = T[:3, :3]
+    t = T[:3, 3]
+    print(f"{prefix}EE → x={t[0]:+.4f}m  y={t[1]:+.4f}m  z={t[2]:+.4f}m")
+    print(f"{prefix}t = {np.array2string(t, precision=6, sign='+')}")
+    print(f"{prefix}R = {np.array2string(R, precision=6, sign='+')}")
 
 
 def _clamp_target(target: np.ndarray, current: np.ndarray) -> np.ndarray:
@@ -158,50 +161,170 @@ def _clamp_target(target: np.ndarray, current: np.ndarray) -> np.ndarray:
 
 # ── Motion ────────────────────────────────────────────────────────────────────
 
-def smooth_move(
+POS_THRESHOLD_M = 0.003   # converged when position error < 3 mm
+ORI_THRESHOLD   = 0.05    # converged when orientation error < ~3 deg
+JAC_MAX_ITER    = 300     # safety cap (~10 s at 30 Hz)
+JAC_ALPHA       = 0.8     # step-size gain — reduce if oscillating
+JAC_LAMBDA      = 0.01    # DLS damping — increase near singularities
+JAC_W_ORI       = 0.3     # orientation weight (rad vs m unit scale)
+STALL_WINDOW    = 10      # steps to look back for stall detection (~0.33 s)
+STALL_MIN_M     = 0.0005  # stall if EE moved less than 0.5 mm over the window
+
+# PID gains applied to position error fed into the Jacobian step.
+# Integral term eliminates steady-state offset; derivative damps oscillation.
+PID_KP          = 1.0     # proportional — keep at 1.0 (JAC_ALPHA handles scaling)
+PID_KI          = 5.0     # integral     — increase to kill residual offset faster
+PID_KD          = 0.05    # derivative   — increase to damp overshoot
+PID_I_CLAMP     = 0.05    # integral windup clamp (meters)
+
+
+def _rot_error(R_target: np.ndarray, R_curr: np.ndarray) -> np.ndarray:
+    """Axis-angle error vector: how much R_curr must rotate to reach R_target."""
+    R_err = R_target @ R_curr.T
+    trace = np.clip((np.trace(R_err) - 1.0) / 2.0, -1.0, 1.0)
+    angle = np.arccos(trace)
+    if abs(angle) < 1e-8:
+        return np.zeros(3)
+    return (angle / (2.0 * np.sin(angle))) * np.array([
+        R_err[2, 1] - R_err[1, 2],
+        R_err[0, 2] - R_err[2, 0],
+        R_err[1, 0] - R_err[0, 1],
+    ])
+
+
+def jacobian_move(
     robot: SO101Follower,
     kin: SO101Kinematics,
     target_pos: np.ndarray,
-    duration_s: float = 2.0,
+    pid_enabled: bool = False,
 ):
     """
-    Straight-line Cartesian interpolation from current EE to target_pos.
-    Orientation held constant. Smoothstep easing. IK warm-started each step.
+    Damped least-squares Jacobian controller.
+
+    Moves the end-effector to target_pos while holding the orientation fixed
+    at whatever it is when the move starts.  Uses only FK — no IK solver.
+
+    Each step:
+      1. Read actual joint angles from hardware.
+      2. FK → current EE pose.
+      3. Compute 6D error (3 position + 3 orientation).
+      4. Build 6×5 numerical Jacobian via finite differences (5 FK calls).
+      5. Δq = Jᵀ(JJᵀ + λI)⁻¹ · error   (damped pseudoinverse)
+      6. Apply step, clamp to URDF limits, send.
     """
     obs = robot.get_observation()
-    q = _joints_from_obs(obs)
-    T_start = kin.forward_kinematics(q)
-    p_start = T_start[:3, 3].copy()
-    gripper_pos = obs["gripper.pos"]
+    q_deg = _joints_from_obs(obs)
+    q_rad = kin._to_ikpy(q_deg[:5])
+    T_start  = kin.chain.forward_kinematics(q_rad)
+    R_target = T_start[:3, :3].copy()
 
-    target_pos = _clamp_target(target_pos, p_start)
-    dist = float(np.linalg.norm(target_pos - p_start))
-    if dist < 1e-4:
+    target_pos = _clamp_target(target_pos, T_start[:3, 3])
+    dist0 = float(np.linalg.norm(target_pos - T_start[:3, 3]))
+    if dist0 < 1e-4:
         print("  Already at target.")
         return
 
-    n_steps = max(int(duration_s * FPS), 1)
-    print(f"  Moving {dist * 100:.1f} cm in {duration_s:.1f}s …")
+    pid_tag = " [PID]" if pid_enabled else ""
+    print(f"  Moving {dist0 * 100:.1f} cm …{pid_tag}")
+    print(f"  {'t(s)':>6}  {'pos mm':>8}  {'ori deg':>8}")
 
-    for i in range(1, n_steps + 1):
+    dt    = 1.0 / FPS
+    dq_fd = 1e-4   # finite-difference step size
+    t_start = time.perf_counter()
+    p_history: list[np.ndarray] = []
+
+    pid_integral  = np.zeros(3)
+    pid_prev_err  = np.zeros(3)
+
+    for _ in range(JAC_MAX_ITER):
         t0 = time.perf_counter()
 
-        alpha = i / n_steps
-        alpha = alpha * alpha * (3.0 - 2.0 * alpha)  # smoothstep
+        obs   = robot.get_observation()
+        q_deg = _joints_from_obs(obs)
+        q_rad = kin._to_ikpy(q_deg[:5])
+        T_curr = kin.chain.forward_kinematics(q_rad)
 
-        T_wp = T_start.copy()
-        T_wp[:3, 3] = (1.0 - alpha) * p_start + alpha * target_pos
+        pos_err  = target_pos - T_curr[:3, 3]
+        rot_err  = _rot_error(R_target, T_curr[:3, :3])
+        pos_dist = float(np.linalg.norm(pos_err))
+        ori_dist = float(np.linalg.norm(rot_err))
+        elapsed  = time.perf_counter() - t_start
 
-        q = kin.inverse_kinematics(q, T_wp)  # warm-start from previous q
+        print(f"  {elapsed:6.3f}  {pos_dist*1000:8.2f}  {np.degrees(ori_dist):8.2f}")
 
-        action = {f"{n}.pos": float(q[j]) for j, n in enumerate(MOTOR_NAMES) if n != "gripper"}
-        action["gripper.pos"] = gripper_pos
+        if pid_enabled:
+            pid_integral = np.clip(pid_integral + pos_err * dt, -PID_I_CLAMP, PID_I_CLAMP)
+            pid_deriv    = (pos_err - pid_prev_err) / dt
+            pos_err      = PID_KP * pos_err + PID_KI * pid_integral + PID_KD * pid_deriv
+            pid_prev_err = pos_err.copy()
+
+        ori_locked = float(np.linalg.norm(rot_err[:2]))
+        if pos_dist < POS_THRESHOLD_M and ori_locked < ORI_THRESHOLD:
+            print(f"  ✓ done  t={elapsed:.3f}s  pos={pos_dist*1000:.1f}mm  ori={np.degrees(ori_locked):.1f}°")
+            break
+
+        # Stall detection: if the EE barely moved over the last STALL_WINDOW steps, give up
+        p_history.append(T_curr[:3, 3].copy())
+        if len(p_history) > STALL_WINDOW:
+            p_history.pop(0)
+        if len(p_history) == STALL_WINDOW:
+            window_travel = float(np.linalg.norm(p_history[-1] - p_history[0]))
+            if window_travel < STALL_MIN_M:
+                print(f"  ✗ stalled  travel={window_travel*1000:.2f}mm over {STALL_WINDOW} steps"
+                      f"  pos={pos_dist*1000:.1f}mm remaining")
+                break
+
+        # 5×5 numerical Jacobian: 3 position + 2 orientation (roll free)
+        J = np.zeros((5, 5))
+        for i, idx in enumerate(kin._arm_idx):
+            q_plus = q_rad.copy()
+            q_plus[idx] += dq_fd
+            T_plus = kin.chain.forward_kinematics(q_plus)
+
+            J[:3, i] = (T_plus[:3, 3] - T_curr[:3, 3]) / dq_fd
+
+            R_diff = T_plus[:3, :3] @ T_curr[:3, :3].T
+            tr = np.clip((np.trace(R_diff) - 1.0) / 2.0, -1.0, 1.0)
+            a  = np.arccos(tr)
+            if abs(a) < 1e-8:
+                J[3:, i] = np.zeros(2)
+            else:
+                ax = (a / (2.0 * np.sin(a) * dq_fd)) * np.array([
+                    R_diff[2, 1] - R_diff[1, 2],
+                    R_diff[0, 2] - R_diff[2, 0],
+                    R_diff[1, 0] - R_diff[0, 1],
+                ])
+                J[3:, i] = ax[:2]  # pitch + yaw only, roll free
+
+        error_5d = np.concatenate([pos_err, JAC_W_ORI * rot_err[:2]])
+        dq_arm   = J.T @ np.linalg.solve(J @ J.T + JAC_LAMBDA * np.eye(5), error_5d)
+
+        # Apply step and clamp to URDF joint limits
+        q_new = q_rad.copy()
+        for i, idx in enumerate(kin._arm_idx):
+            q_new[idx] += JAC_ALPHA * dq_arm[i]
+            link = kin.chain.links[idx]
+            if link.bounds is not None:
+                lo, hi = link.bounds
+                if lo is not None:
+                    q_new[idx] = max(q_new[idx], lo)
+                if hi is not None:
+                    q_new[idx] = min(q_new[idx], hi)
+
+        q_deg_new = q_deg.copy()
+        q_deg_new[:5] = kin._from_ikpy(q_new)
+
+        action = {f"{n}.pos": float(q_deg_new[j]) for j, n in enumerate(MOTOR_NAMES) if n != "gripper"}
+        action["gripper.pos"] = obs["gripper.pos"]
         robot.send_action(action)
 
-        time.sleep(max(1.0 / FPS - (time.perf_counter() - t0), 0.0))
-
-    obs = robot.get_observation()
-    _print_ee(kin.forward_kinematics(_joints_from_obs(obs)), prefix="  done → ")
+        time.sleep(max(dt - (time.perf_counter() - t0), 0.0))
+    else:
+        obs     = robot.get_observation()
+        T_final = kin.chain.forward_kinematics(kin._to_ikpy(_joints_from_obs(obs)[:5]))
+        rem_pos = float(np.linalg.norm(target_pos - T_final[:3, 3]))
+        rem_ori = float(np.linalg.norm(_rot_error(R_target, T_final[:3, :3])))
+        print(f"  ✗ max iters  pos={rem_pos*1000:.1f}mm  ori={np.degrees(rem_ori):.1f}°")
 
 
 # ── REPL ──────────────────────────────────────────────────────────────────────
@@ -210,11 +333,17 @@ HELP = """\
   status / s              print current EE position
   go <x|y|z> <meters>    relative move along one axis
   move <x> <y> <z>       absolute move to position (meters)
+  pid                     toggle PID position correction on/off
   quit / q                disconnect and exit"""
 
 
 def run_repl(robot: SO101Follower, kin: SO101Kinematics):
     print("SO-101 EE Controller  —  type 'help' for commands\n")
+
+    obs = robot.get_observation()
+    start_pos = kin.forward_kinematics(_joints_from_obs(obs))[:3, 3].copy()
+
+    pid_enabled = False
 
     while True:
         obs = robot.get_observation()
@@ -235,6 +364,8 @@ def run_repl(robot: SO101Follower, kin: SO101Kinematics):
         cmd = tokens[0]
 
         if cmd in ("q", "quit", "exit"):
+            print("  Returning to start position …")
+            jacobian_move(robot, kin, start_pos, pid_enabled)
             break
 
         elif cmd in ("s", "status"):
@@ -242,6 +373,11 @@ def run_repl(robot: SO101Follower, kin: SO101Kinematics):
 
         elif cmd == "help":
             print(HELP)
+
+        elif cmd == "pid":
+            pid_enabled = not pid_enabled
+            print(f"  PID {'enabled' if pid_enabled else 'disabled'}"
+                  f"  (Kp={PID_KP}  Ki={PID_KI}  Kd={PID_KD})")
 
         elif cmd == "go":
             if len(tokens) != 3:
@@ -259,7 +395,7 @@ def run_repl(robot: SO101Follower, kin: SO101Kinematics):
 
             target = T[:3, 3].copy()
             target[axis_map[tokens[1]]] += delta
-            smooth_move(robot, kin, target, duration_s=max(abs(delta) / 0.12, 1.0))
+            jacobian_move(robot, kin, target, pid_enabled)
 
         elif cmd == "move":
             # Accept plain numbers, labels (x=0.1), or copy-pasted EE output (x=+0.24m)
@@ -274,8 +410,7 @@ def run_repl(robot: SO101Follower, kin: SO101Kinematics):
                 continue
 
             target = np.array(nums)
-            dist = float(np.linalg.norm(target - T[:3, 3]))
-            smooth_move(robot, kin, target, duration_s=max(dist / 0.12, 1.0))
+            jacobian_move(robot, kin, target, pid_enabled)
 
         else:
             print(f"  Unknown command '{cmd}'. Type 'help'.")

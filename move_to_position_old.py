@@ -37,8 +37,10 @@ FPS             = 30
 ARM_JOINTS  = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll"]
 MOTOR_NAMES = ARM_JOINTS + ["gripper"]
 
+ROLL_FIXED_DEG = -90.0   # wrist roll held at this angle; change to reorient gripper
+
 # Safe workspace bounds in meters
-WS_MIN      = np.array([-0.35, -0.35,  0.00])
+WS_MIN      = np.array([-0.35, -0.35,  -0.10])
 WS_MAX      = np.array([ 0.35,  0.35,  0.50])
 MAX_MOVE_M  = 0.30   # maximum single-move distance (safety clamp)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -57,11 +59,13 @@ class SO101Kinematics:
         _probe = Chain.from_urdf_file(urdf_path)
         self._link_names = [lnk.name for lnk in _probe.links]
 
-        # Active = only the 5 arm joints; everything else (base, gripper, tip) passive
-        mask = [name in ARM_JOINTS for name in self._link_names]
+        # Active = 4 arm joints; wrist_roll is passive (held at ROLL_FIXED_DEG)
+        _active = [j for j in ARM_JOINTS if j != "wrist_roll"]
+        mask = [name in _active for name in self._link_names]
 
         self.chain = Chain.from_urdf_file(urdf_path, active_links_mask=mask)
         self._arm_idx = [self._link_names.index(n) for n in ARM_JOINTS]
+        self._wrist_roll_link_idx = self._link_names.index("wrist_roll")
 
         print("Kinematic chain:")
         for i, name in enumerate(self._link_names):
@@ -114,6 +118,8 @@ class SO101Kinematics:
         # Clip initial guess to URDF joint limits — motor degree values can
         # sit just outside the limits due to calibration tolerances.
         initial = self._clip_to_bounds(self._to_ikpy(current_deg[:5]))
+        # Fix wrist_roll in the initial vector — optimizer leaves passive joints untouched
+        initial[self._wrist_roll_link_idx] = np.deg2rad(ROLL_FIXED_DEG)
 
         result = self.chain.inverse_kinematics(
             target_position=target_T[:3, 3],
@@ -121,6 +127,7 @@ class SO101Kinematics:
         )
         out = np.array(current_deg, dtype=float)
         out[:5] = self._from_ikpy(result)
+        out[4] = ROLL_FIXED_DEG   # enforce fixed roll explicitly
         return out
 
 
@@ -142,7 +149,11 @@ def _joints_from_obs(obs: dict) -> np.ndarray:
 
 def _print_ee(T: np.ndarray, prefix: str = ""):
     p = T[:3, 3]
+    R = T[:3, :3]
     print(f"{prefix}EE → x={p[0]:+.4f}m  y={p[1]:+.4f}m  z={p[2]:+.4f}m")
+    print(f"{prefix}R  = {np.array2string(R[0], precision=4, sign='+')}")
+    print(f"{prefix}     {np.array2string(R[1], precision=4, sign='+')}")
+    print(f"{prefix}     {np.array2string(R[2], precision=4, sign='+')}")
 
 
 def _clamp_target(target: np.ndarray, current: np.ndarray) -> np.ndarray:
@@ -156,69 +167,153 @@ def _clamp_target(target: np.ndarray, current: np.ndarray) -> np.ndarray:
 
 # ── Motion ────────────────────────────────────────────────────────────────────
 
+# PID gains for the Cartesian settle loop.
+# Start with KI=0, KD=0 and raise KP until sustained oscillation for Z-N tuning.
+KP = 1.0    # proportional
+KI = 5.0    # integral — eliminates steady-state error from friction/deadband
+KD = 0.0    # derivative — damps oscillation
+
+SETTLE_THRESHOLD_M = 0.003   # stop when FK error < 3 mm
+SETTLE_MAX_ITER    = 60      # safety cap (~2 s at 30 Hz)
+D_ALPHA            = 0.3     # derivative low-pass coefficient (0=frozen, 1=raw)
+
+
+def settle(
+    robot: SO101Follower,
+    kin: SO101Kinematics,
+    target_pos: np.ndarray,
+    target_T: np.ndarray,
+):
+    """
+    PID settle loop in Cartesian space.
+
+    Runs after smooth_move to drive the FK-reported position error to zero.
+    Error = target_pos − FK(actual_joint_angles)[:3,3]
+    The PID output shifts the IK target each step until error < SETTLE_THRESHOLD_M.
+
+    Also performs Z-N peak detection: prints Tu and suggested gains when
+    sustained oscillations are detected (useful while tuning KP).
+    """
+    integral   = np.zeros(3)
+    prev_error = np.zeros(3)
+    deriv_filt = np.zeros(3)
+    dt         = 1.0 / FPS
+    t_start    = time.perf_counter()
+
+    dist_buf:   list[float] = []
+    t_buf:      list[float] = []
+    peak_times: list[float] = []
+
+    print(f"  {'t(s)':>6}  {'|err|mm':>8}  {'x mm':>8}  {'y mm':>8}  {'z mm':>8}")
+
+    for _ in range(SETTLE_MAX_ITER):
+        t0 = time.perf_counter()
+
+        obs    = robot.get_observation()
+        q      = _joints_from_obs(obs)
+        T_curr = kin.forward_kinematics(q)
+        p_curr = T_curr[:3, 3]
+
+        error   = target_pos - p_curr
+        dist    = float(np.linalg.norm(error))
+        elapsed = t0 - t_start
+
+        print(f"  {elapsed:6.3f}  {dist*1000:8.2f}"
+              f"  {error[0]*1000:+8.2f}  {error[1]*1000:+8.2f}  {error[2]*1000:+8.2f}")
+
+        # 3-point peak detection on scalar |err| for Z-N Tu estimation
+        dist_buf.append(dist)
+        t_buf.append(elapsed)
+        if len(dist_buf) >= 3:
+            d0, d1, d2 = dist_buf[-3], dist_buf[-2], dist_buf[-1]
+            if d1 > d0 and d1 > d2 and d1 > SETTLE_THRESHOLD_M * 3:
+                peak_times.append(t_buf[-2])
+
+        if dist < SETTLE_THRESHOLD_M:
+            print(f"  ✓ settled  t={elapsed:.3f}s  final={dist*1000:.1f}mm  KP={KP}")
+            break
+
+        # PID — derivative is low-pass filtered to suppress sensor noise
+        integral  += error * dt
+        raw_deriv  = (error - prev_error) / dt
+        deriv_filt = D_ALPHA * raw_deriv + (1 - D_ALPHA) * deriv_filt
+        correction = KP * error + KI * integral + KD * deriv_filt
+        prev_error = error
+
+        # Clamp correction magnitude to prevent wild IK jumps
+        corr_norm = float(np.linalg.norm(correction))
+        if corr_norm > 0.05:
+            correction *= 0.05 / corr_norm
+
+        T_cmd = target_T.copy()
+        T_cmd[:3, 3] = p_curr + correction
+
+        q = kin.inverse_kinematics(q, T_cmd)
+
+        action = {f"{n}.pos": float(q[j]) for j, n in enumerate(MOTOR_NAMES) if n != "gripper"}
+        action["gripper.pos"] = obs["gripper.pos"]
+        robot.send_action(action)
+
+        time.sleep(max(dt - (time.perf_counter() - t0), 0.0))
+    else:
+        obs       = robot.get_observation()
+        T_final   = kin.forward_kinematics(_joints_from_obs(obs))
+        remaining = float(np.linalg.norm(target_pos - T_final[:3, 3]))
+        print(f"  ✗ max iters  residual={remaining*1000:.1f}mm  KP={KP}")
+
+    # Z-N Tu from peak-to-peak intervals (need ≥ 2 peaks = one full cycle)
+    if len(peak_times) >= 2:
+        periods = [peak_times[i+1] - peak_times[i] for i in range(len(peak_times)-1)]
+        Tu_est  = float(np.median(periods))
+        Ku      = KP
+        print(f"\n  Peaks: {len(peak_times)}  Tu ≈ {Tu_est:.3f}s  Ku = {Ku}")
+        print(f"  Z-N no-overshoot:   KP={0.20*Ku:.3f}  KI={0.40*Ku/Tu_est:.3f}  KD={0.066*Ku*Tu_est:.4f}")
+        print(f"  Z-N some-overshoot: KP={0.33*Ku:.3f}  KI={0.66*Ku/Tu_est:.3f}  KD={0.110*Ku*Tu_est:.4f}")
+    elif len(peak_times) == 1:
+        print("  Only 1 peak — need sustained oscillation. Raise KP slightly.")
+    else:
+        trend = "converging — raise KP" if (dist_buf and dist_buf[-1] < dist_buf[0]) else "diverging — lower KP"
+        print(f"  No peaks detected ({trend})")
+
+
 def smooth_move(
     robot: SO101Follower,
     kin: SO101Kinematics,
     target_pos: np.ndarray,
-    speed_m_per_s: float = 0.10,
-    stop_thresh_m: float = 0.004,
+    duration_s: float = 2.0,
 ):
     """
-    Closed-loop proportional controller.
-
-    Each cycle:
-      1. Read the actual robot joint positions.
-      2. Compute current EE position via FK.
-      3. Step toward target proportionally, capped at (speed / FPS) per cycle.
-      4. Run IK from actual joints (warm-start) with orientation preserved.
-      5. Send command.
-
-    Because we always re-read the real robot state, motor-tracking lag and small
-    IK residuals are corrected every cycle instead of accumulating.
+    Smoothstep Cartesian interpolation to target_pos, then PID settle.
+    Orientation is held constant throughout.
     """
-    obs = robot.get_observation()
-    q = _joints_from_obs(obs)
+    obs    = robot.get_observation()
+    q      = _joints_from_obs(obs)
     T_start = kin.forward_kinematics(q)
     p_start = T_start[:3, 3].copy()
     gripper_pos = obs["gripper.pos"]
 
     target_pos = _clamp_target(target_pos, p_start)
-    total_dist = float(np.linalg.norm(target_pos - p_start))
-    if total_dist < stop_thresh_m:
+    dist = float(np.linalg.norm(target_pos - p_start))
+    if dist < 1e-4:
         print("  Already at target.")
         return
 
-    # Build full target pose: position = target, orientation = start (preserved)
     T_target = T_start.copy()
     T_target[:3, 3] = target_pos
 
-    max_step = speed_m_per_s / FPS          # max meters to move per cycle
-    max_iters = int(total_dist / max_step * 4) + 60   # generous timeout
-    print(f"  Moving {total_dist * 100:.1f} cm …")
+    n_steps = max(int(duration_s * FPS), 1)
+    print(f"  Moving {dist * 100:.1f} cm in {duration_s:.1f}s …")
 
-    for _ in range(max_iters):
+    for i in range(1, n_steps + 1):
         t0 = time.perf_counter()
 
-        # Re-read actual robot state every cycle — this is the key difference
-        obs = robot.get_observation()
-        q = _joints_from_obs(obs)
-        T_curr = kin.forward_kinematics(q)
-        p_curr = T_curr[:3, 3]
+        alpha = i / n_steps
+        alpha = alpha * alpha * (3.0 - 2.0 * alpha)  # smoothstep easing
 
-        error = target_pos - p_curr
-        err_dist = float(np.linalg.norm(error))
-        if err_dist < stop_thresh_m:
-            break
+        T_wp = T_start.copy()
+        T_wp[:3, 3] = (1.0 - alpha) * p_start + alpha * target_pos
 
-        # P step: move a fraction of the error, capped at max_step
-        step = error * min(1.0, max_step / err_dist)
-
-        # Waypoint pose: step in position, preserve start orientation
-        T_wp = T_target.copy()
-        T_wp[:3, 3] = p_curr + step
-
-        # IK warm-started from actual current joints
-        q = kin.inverse_kinematics(q, T_wp)
+        q = kin.inverse_kinematics(q, T_wp)  # warm-start from previous q
 
         action = {f"{n}.pos": float(q[j]) for j, n in enumerate(MOTOR_NAMES) if n != "gripper"}
         action["gripper.pos"] = gripper_pos
@@ -226,8 +321,8 @@ def smooth_move(
 
         time.sleep(max(1.0 / FPS - (time.perf_counter() - t0), 0.0))
 
-    obs = robot.get_observation()
-    _print_ee(kin.forward_kinematics(_joints_from_obs(obs)), prefix="  done → ")
+    # PID settle to drive residual FK error to zero
+    settle(robot, kin, target_pos, T_target)
 
 
 # ── REPL ──────────────────────────────────────────────────────────────────────
