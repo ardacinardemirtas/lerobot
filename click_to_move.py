@@ -66,10 +66,10 @@ DIST_COEFFS = np.array(
 # Hand-eye: 4×4 transform from camera frame → end-effector frame (P_ee = T_EE_CAM @ P_cam)
 # Ground truth — verified independently by two solvers (PARK/HORAUD/DANIILIDIS + external).
 T_EE_CAM = np.array([
-    [-0.998972,  0.003967,  0.045150, -0.006058],
-    [-0.022214, -0.911169, -0.411433,  0.068949],
-    [ 0.039507, -0.412013,  0.910321, -0.057824],
-    [ 0.000000,  0.000000,  0.000000,  1.000000],
+    [-0.99938712, +0.02241607, +0.02688672, -0.00942822],
+    [-0.03310399, -0.85490033, -0.51773502, +0.06081714],
+    [+0.01137988, -0.51830777, +0.85511845, -0.03862474],
+    [ 0.00000000,  0.00000000,  0.00000000,  1.00000000],
 ], dtype=float)
 
 # Height of the work surface in robot base frame — table is at z = 0

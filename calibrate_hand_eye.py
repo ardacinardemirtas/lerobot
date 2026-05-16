@@ -72,7 +72,7 @@ CAMERA_WIDTH  = 640
 CAMERA_HEIGHT = 480
 
 # Where calibration images and JSON files are saved
-OUTPUT_DIR = Path(r"C:\Users\plata\robots\lerobot\calibration\hand_eye_data")
+OUTPUT_DIR = Path(r"C:\Users\plata\robots\lerobot\calibration\hand_eye_data_4")
 
 # Home configuration (same as click_to_move.py)
 # Order: shoulder_pan, shoulder_lift, elbow_flex, wrist_flex, wrist_roll, gripper
