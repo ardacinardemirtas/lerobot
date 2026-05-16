@@ -93,7 +93,7 @@ HOVER_OFFSET_M = 0.04
 # How far below the PnP-derived key-top surface to aim for the press.
 # The arm physically can't reach this — stall detection stops it at contact.
 # Larger value = more assertive descent before stall fires.
-PRESS_BELOW_M = 0.008
+PRESS_BELOW_M = 0.005
 
 # Press-settle stall detection (ported from move_to_position.py)
 # If the EE moves less than STALL_MIN_M over STALL_WINDOW consecutive steps
@@ -242,13 +242,17 @@ def _pnp_key_position(
     robot: SO101Follower,
     kin: SO101Kinematics,
     step_label: str,
-) -> tuple[np.ndarray, float]:
+) -> np.ndarray:
     """
-    Run detection + PnP on frame, return (key_pos_base, keyboard_z).
+    Run detection + PnP on frame, return key_pos_base (3,) in robot base frame.
 
-    keyboard_z is the PnP-derived Z of the key surface in robot base frame.
+    T_base_cam is read BEFORE the network call so the FK matches the captured
+    frame even if the API call takes several seconds.
     Raises ValueError if detection or PnP fails.
     """
+    # Read FK now, while the arm is settled and the frame was just captured.
+    T_bc = _T_base_cam(robot, kin)
+
     t0    = time.perf_counter()
     preds = detect_keys(frame)
     print(f"  [{step_label}] Detection: {len(preds)} objects in "
@@ -258,7 +262,6 @@ def _pnp_key_position(
     if not dets:
         raise ValueError(f"[{step_label}] No keys detected.")
 
-    T_bc = _T_base_cam(robot, kin)
     positions, reproj_err = get_key_positions_in_base_frame(
         dets, T_bc, CAMERA_K, DIST_COEFFS
     )
@@ -271,13 +274,10 @@ def _pnp_key_position(
             f"[{step_label}] '{target_key}' not in German ISO layout."
         )
 
-    key_pos   = positions[canonical]
-    # Use the median Z of all keys as a robust surface estimate
-    keyboard_z = float(np.median([p[2] for p in positions.values()]))
+    key_pos = positions[canonical]
     print(f"  [{step_label}] '{target_key}' → "
-          f"({key_pos[0]:+.4f}, {key_pos[1]:+.4f}, {key_pos[2]:+.4f}) m  "
-          f"[surface z={keyboard_z:+.4f} m]")
-    return key_pos, keyboard_z
+          f"({key_pos[0]:+.4f}, {key_pos[1]:+.4f}, {key_pos[2]:+.4f}) m")
+    return key_pos
 
 
 # ─── Two-step press ───────────────────────────────────────────────────────────
@@ -314,12 +314,21 @@ def press_key(
     if frame is None:
         raise RuntimeError("Camera read failed.")
 
-    key_pos_coarse, keyboard_z_coarse = _pnp_key_position(
+    key_pos_coarse = _pnp_key_position(
         frame, target_key, robot, kin, "coarse"
     )
 
-    hover_z  = keyboard_z_coarse + HOVER_OFFSET_M
-    coarse_target = np.array([key_pos_coarse[0], key_pos_coarse[1], hover_z])
+    # Hover directly above the target key using its own PnP-derived Z.
+    # Previously keyboard_z (median of all 70+ layout keys, including
+    # extrapolated off-screen ones) was used here.  That median is biased
+    # by inaccurate extrapolated positions and places the camera at the
+    # wrong height for the fine PnP, producing a consistent forward shift
+    # in the key position estimate (~one keyboard row per ~2 cm hover error).
+    coarse_target = np.array([
+        key_pos_coarse[0],
+        key_pos_coarse[1],
+        key_pos_coarse[2] + HOVER_OFFSET_M,
+    ])
 
     # Clamp to workspace
     coarse_target = np.clip(coarse_target, WS_MIN, WS_MAX)
@@ -339,12 +348,17 @@ def press_key(
     if frame is None:
         raise RuntimeError("Camera read failed (fine step).")
 
-    key_pos_fine, keyboard_z_fine = _pnp_key_position(
+    key_pos_fine = _pnp_key_position(
         frame, target_key, robot, kin, "fine"
     )
 
-    press_z = keyboard_z_fine - PRESS_BELOW_M
-    fine_target = np.array([key_pos_fine[0], key_pos_fine[1], press_z])
+    # Use the key's own Z for the press target — the median was biased by
+    # off-screen extrapolated keys, causing over-descent and a forward push.
+    fine_target = np.array([
+        key_pos_fine[0],
+        key_pos_fine[1],
+        key_pos_fine[2] - PRESS_BELOW_M,
+    ])
     fine_target = np.clip(fine_target, WS_MIN, WS_MAX)
     print(f"  Press target = ({fine_target[0]:+.4f}, {fine_target[1]:+.4f}, "
           f"{fine_target[2]:+.4f}) m  (stall-detect descent)")
@@ -358,7 +372,7 @@ def press_key(
     # ── Lift ─────────────────────────────────────────────────────────────────
     if lift:
         lift_target    = fine_target.copy()
-        lift_target[2] = keyboard_z_fine + HOVER_OFFSET_M
+        lift_target[2] = key_pos_fine[2] + HOVER_OFFSET_M
         lift_target    = np.clip(lift_target, WS_MIN, WS_MAX)
         _move(robot, kin, lift_target, pid=False, cancel_event=cancel_event)
         print(f"  Lifted to z={lift_target[2]:+.4f} m")
