@@ -40,7 +40,7 @@ JOINT_INDEX = {name: i for i, name in enumerate(MOTOR_NAMES)}
 FIXED_WRIST_ROLL_DEG = -90.0  # held constant; not IK-controlled
 
 WS_MIN     = np.array([-0.35, -0.35, -0.10])
-WS_MAX     = np.array([ 0.35,  0.35,  0.50])
+WS_MAX     = np.array([ 0.50,  0.50,  0.50])
 MAX_MOVE_M = 0.30
 
 # Controller gains (mirror of ControllerConfig defaults in move_to_position_new.py)
@@ -443,12 +443,17 @@ def smooth_move(robot, kin: SO101Kinematics, target_pos: np.ndarray) -> dict:
     step and the arm would never move.  The accumulator lets commands grow
     continuously while FK / error feedback still uses the real measured position.
     """
-    dt      = 1.0 / FPS
-    obs     = robot.get_observation()
-    q_start = kin.clip_joints(_joints_from_obs(obs))
+    dt    = 1.0 / FPS
+    obs   = robot.get_observation()
+    q_obs = kin.clip_joints(_joints_from_obs(obs))
+    # p_start from actual q so it matches p_curr (which also uses actual wrist).
+    # Overriding wrist before FK would create a phantom initial error whenever
+    # the real wrist differs from the fixed commanded value.
+    p_start = kin.forward_kinematics(q_obs)[:3, 3].copy()
+
+    q_start = q_obs.copy()
     q_start[JOINT_INDEX["wrist_flex"]] = kin.fixed_wrist_flex_deg
     q_start[JOINT_INDEX["wrist_roll"]] = FIXED_WRIST_ROLL_DEG
-    p_start = kin.forward_kinematics(q_start)[:3, 3].copy()
 
     target   = _clamp_target(np.asarray(target_pos, dtype=float), p_start)
     distance = float(np.linalg.norm(target - p_start))
