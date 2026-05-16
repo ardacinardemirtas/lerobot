@@ -91,16 +91,16 @@ from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
 HOVER_OFFSET_M = 0.04
 
 # How far below the PnP-derived key-top surface to aim for the press.
-# The arm physically can't reach this — stall detection stops it at contact.
-# Larger value = more assertive descent before stall fires.
-PRESS_BELOW_M = 0.005
+# Stall detection stops descent at key contact regardless of this value.
+# Smaller = gentler; 3 mm is enough to ensure contact given typical PnP error.
+PRESS_BELOW_M = 0.003
 
-# Press-settle stall detection (ported from move_to_position.py)
+# Press-settle stall detection
 # If the EE moves less than STALL_MIN_M over STALL_WINDOW consecutive steps
 # it has made contact with the key and we stop immediately.
-_STALL_WINDOW   = 10     # ~0.33 s at 30 Hz
-_STALL_MIN_M    = 0.0004 # < 0.4 mm travel → contact
-_PRESS_MAX_ITER = 60     # hard cap (~2 s)
+_STALL_WINDOW   = 5      # ~0.08 s at 60 Hz — detect contact quickly
+_STALL_MIN_M    = 0.0003 # < 0.3 mm travel → contact
+_PRESS_MAX_ITER = 80     # hard cap (~1.3 s)
 
 # Roboflow inference
 INFERENCE_HOST   = os.environ.get("INFERENCE_HOST",    "http://localhost:9001")
@@ -171,20 +171,15 @@ def _press_down(
     """
     Gentle key-press descent with stall detection.
 
-    Phase 1: QP smooth-move approach to the press target.
-    Phase 2: stall-detecting settle using a damped Jacobian pseudoinverse step;
-             exits as soon as EE stalls (physical key contact).
+    Descends from the current hover position toward target_pos using a
+    Z-only damped Jacobian step. XY is never commanded to change, which
+    prevents the end-effector from drifting forward during the press.
+    Stops as soon as stall (key contact) is detected or Z target is reached.
 
     Returns 'contact', 'done', 'cancelled', or 'max_iter'.
     """
     stop = cancel_event if cancel_event is not None else threading.Event()
 
-    # Phase 1 — approach
-    smooth_move(robot, kin, target_pos)
-    if stop.is_set():
-        return "cancelled"
-
-    # Phase 2 — stall-detecting settle with damped Jacobian pseudoinverse
     dt = 1.0 / FPS
     p_history: list[np.ndarray] = []
 
@@ -197,10 +192,9 @@ def _press_down(
         q   = _joints_from_obs(obs)
         p   = kin.forward_kinematics(q)[:3, 3]
 
-        error = target_pos - p
-        dist  = float(np.linalg.norm(error))
+        z_err = float(target_pos[2] - p[2])
 
-        if dist < SETTLE_THRESHOLD_M:
+        if abs(z_err) < SETTLE_THRESHOLD_M:
             return "done"
 
         # Stall detection — stopped making progress → key contact
@@ -212,15 +206,16 @@ def _press_down(
             if travel < _STALL_MIN_M:
                 print(f"  [press] Key contact  "
                       f"travel={travel*1000:.2f}mm / {_STALL_WINDOW} steps  "
-                      f"residual={dist*1000:.1f}mm")
+                      f"z_residual={abs(z_err)*1000:.1f}mm")
                 return "contact"
 
-        # Damped Jacobian pseudoinverse step (no IK library required)
-        correction = np.clip(error, -0.006, 0.006)
+        # Z-only Jacobian step — drives arm straight down, no XY correction
+        # so the end-effector cannot drift forward during the press.
+        z_correction = np.array([0.0, 0.0, np.clip(z_err, -0.0015, 0.0015)])
         J = kin.position_jacobian(q, kin.active_joints)
         lam_sq = 0.0025
         J_damp = J.T @ np.linalg.inv(J @ J.T + lam_sq * np.eye(3))
-        delta_q_deg = np.degrees(J_damp @ correction)
+        delta_q_deg = np.degrees(J_damp @ z_correction)
         for i, name in enumerate(kin.active_joints):
             q[JOINT_INDEX[name]] += delta_q_deg[i]
         q = kin.clip_joints(q)
