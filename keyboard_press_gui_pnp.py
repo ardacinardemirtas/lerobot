@@ -53,6 +53,7 @@ from press_key_pnp import (  # noqa: E402
     detect_keys,
     press_key,
     ROBOFLOW_API_KEY,
+    INTERMEDIATE_OFFSET_M,
     HOVER_OFFSET_M,
 )
 from keyboard_pnp import (  # noqa: E402
@@ -320,7 +321,7 @@ class KeyboardPressGUI:
         cv2.putText(
             frame,
             f"click=press  right-click=cancel  r=home  o=PnP overlay  q=quit  "
-            f"hover={HOVER_OFFSET_M*100:.0f}cm above surface",
+            f"observe={INTERMEDIATE_OFFSET_M*100:.0f}cm → hover={HOVER_OFFSET_M*100:.0f}cm",
             (8, h - bar_h + 40),
             cv2.FONT_HERSHEY_SIMPLEX, 0.33, (160, 220, 160), 1, cv2.LINE_AA,
         )
