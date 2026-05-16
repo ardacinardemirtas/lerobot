@@ -54,9 +54,6 @@ if _ENV_FILE.exists():
             os.environ.setdefault(_k.strip(), _v.strip())
 
 from click_to_move import (  # noqa: E402
-    SO101Kinematics,
-    smooth_move,
-    _joints_from_obs,
     CAMERA_K,
     DIST_COEFFS,
     T_EE_CAM,
@@ -72,7 +69,14 @@ from click_to_move import (  # noqa: E402
     WS_MAX,
     MOTOR_NAMES,
     FPS,
+)
+from move_to_position_qp import (  # noqa: E402
+    SO101Kinematics,
+    smooth_move,
+    _joints_from_obs,
     SETTLE_THRESHOLD_M,
+    FIXED_WRIST_ROLL_DEG,
+    JOINT_INDEX,
 )
 from keyboard_pnp import (  # noqa: E402
     detections_from_roboflow,
@@ -152,8 +156,10 @@ def _move(
     pid: bool = False,
     cancel_event: threading.Event | None = None,
 ) -> str:
-    stop = cancel_event if cancel_event is not None else threading.Event()
-    return smooth_move(robot, kin, target, stop, pid_enabled=pid)
+    smooth_move(robot, kin, target)
+    if cancel_event is not None and cancel_event.is_set():
+        return "cancelled"
+    return "done"
 
 
 def _press_down(
@@ -165,29 +171,22 @@ def _press_down(
     """
     Gentle key-press descent with stall detection.
 
-    Phase 1: slow smoothstep approach (no PID — no integral wind-up).
-    Phase 2: proportional-only settle that exits as soon as the EE stalls,
-             which signals physical contact with the key surface.
+    Phase 1: QP smooth-move approach to the press target.
+    Phase 2: stall-detecting settle using a damped Jacobian pseudoinverse step;
+             exits as soon as EE stalls (physical key contact).
 
     Returns 'contact', 'done', 'cancelled', or 'max_iter'.
     """
     stop = cancel_event if cancel_event is not None else threading.Event()
 
-    # Phase 1 — slow descent to near the key (no PID, short duration)
-    result = smooth_move(robot, kin, target_pos, stop,
-                         pid_enabled=False, duration_s=1.0)
-    if result == "cancelled":
+    # Phase 1 — approach
+    smooth_move(robot, kin, target_pos)
+    if stop.is_set():
         return "cancelled"
 
-    # Phase 2 — stall-detecting settle (proportional only, no integral)
+    # Phase 2 — stall-detecting settle with damped Jacobian pseudoinverse
     dt = 1.0 / FPS
     p_history: list[np.ndarray] = []
-
-    obs = robot.get_observation()
-    q   = _joints_from_obs(obs)
-    T   = kin.forward_kinematics(q)
-    T_target = T.copy()
-    T_target[:3, 3] = target_pos
 
     for _ in range(_PRESS_MAX_ITER):
         if stop.is_set():
@@ -196,8 +195,7 @@ def _press_down(
         t0  = time.perf_counter()
         obs = robot.get_observation()
         q   = _joints_from_obs(obs)
-        T   = kin.forward_kinematics(q)
-        p   = T[:3, 3]
+        p   = kin.forward_kinematics(q)[:3, 3]
 
         error = target_pos - p
         dist  = float(np.linalg.norm(error))
@@ -205,7 +203,7 @@ def _press_down(
         if dist < SETTLE_THRESHOLD_M:
             return "done"
 
-        # Stall detection — have we stopped making progress?
+        # Stall detection — stopped making progress → key contact
         p_history.append(p.copy())
         if len(p_history) > _STALL_WINDOW:
             p_history.pop(0)
@@ -217,15 +215,20 @@ def _press_down(
                       f"residual={dist*1000:.1f}mm")
                 return "contact"
 
-        # Proportional step only — no integral, no wind-up
+        # Damped Jacobian pseudoinverse step (no IK library required)
         correction = np.clip(error, -0.006, 0.006)
-        T_cmd = T_target.copy()
-        T_cmd[:3, 3] = p + correction
-        q = kin.inverse_kinematics(q, T_cmd)
+        J = kin.position_jacobian(q, kin.active_joints)
+        lam_sq = 0.0025
+        J_damp = J.T @ np.linalg.inv(J @ J.T + lam_sq * np.eye(3))
+        delta_q_deg = np.degrees(J_damp @ correction)
+        for i, name in enumerate(kin.active_joints):
+            q[JOINT_INDEX[name]] += delta_q_deg[i]
+        q = kin.clip_joints(q)
 
         action = {f"{n}.pos": float(q[j]) for j, n in enumerate(MOTOR_NAMES)
                   if n != "gripper"}
         action["gripper.pos"] = obs["gripper.pos"]
+        action["wrist_roll.pos"] = FIXED_WRIST_ROLL_DEG
         robot.send_action(action)
 
         time.sleep(max(dt - (time.perf_counter() - t0), 0.0))

@@ -34,8 +34,6 @@ if _ENV_FILE.exists():
             os.environ.setdefault(_k.strip(), _v.strip())
 
 from click_to_move import (  # noqa: E402
-    SO101Kinematics,
-    smooth_move,
     CAMERA_WIDTH,
     CAMERA_HEIGHT,
     PORT,
@@ -46,6 +44,10 @@ from click_to_move import (  # noqa: E402
     HOME_DEG,
     CAMERA_K,
     DIST_COEFFS,
+)
+from move_to_position_qp import (  # noqa: E402
+    SO101Kinematics,
+    smooth_move,
 )
 from press_key_pnp import (  # noqa: E402
     detect_keys,
@@ -238,8 +240,7 @@ class KeyboardPressGUI:
 
     def _home_worker(self) -> None:
         self._status = "Returning to home …"
-        stop = threading.Event()
-        smooth_move(self.robot, self.kin, self._home, stop, pid_enabled=False)
+        smooth_move(self.robot, self.kin, self._home)
         self._status = "At home"
 
     # ── Drawing ───────────────────────────────────────────────────────────────

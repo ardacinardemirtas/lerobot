@@ -91,6 +91,35 @@ def _parse_vec(text: str | None, default: Iterable[float] = (0.0, 0.0, 0.0)) -> 
     return np.asarray([float(x) for x in text.split()], dtype=float)
 
 
+def _rx(angle: float) -> np.ndarray:
+    c = math.cos(angle); s = math.sin(angle)
+    return np.array([[1.0, 0.0, 0.0], [0.0, c, -s], [0.0, s, c]], dtype=float)
+
+def _ry(angle: float) -> np.ndarray:
+    c = math.cos(angle); s = math.sin(angle)
+    return np.array([[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]], dtype=float)
+
+def _rz(angle: float) -> np.ndarray:
+    c = math.cos(angle); s = math.sin(angle)
+    return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]], dtype=float)
+
+def _rpy_to_matrix(rpy: np.ndarray) -> np.ndarray:
+    roll, pitch, yaw = [float(v) for v in rpy]
+    return _rz(yaw) @ _ry(pitch) @ _rx(roll)
+
+def _axis_angle_to_matrix(axis: np.ndarray, angle: float) -> np.ndarray:
+    norm = float(np.linalg.norm(axis))
+    if norm < 1e-12:
+        return np.eye(3)
+    x, y, z = axis / norm
+    k = np.array([[0.0, -z, y], [z, 0.0, -x], [-y, x, 0.0]], dtype=float)
+    return np.eye(3) + math.sin(angle) * k + (1.0 - math.cos(angle)) * (k @ k)
+
+def _transform(xyz: np.ndarray, rpy: np.ndarray) -> np.ndarray:
+    out = np.eye(4, dtype=float)
+    out[:3, :3] = _rpy_to_matrix(rpy)
+    out[:3, 3]  = xyz
+    return out
 
 
 class SO101Kinematics:
