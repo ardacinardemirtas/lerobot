@@ -33,9 +33,11 @@ CALIBRATION_DIR = Path(r"C:\Users\plata\robots")
 URDF_PATH       = r"C:\Users\plata\robots\lerobot\calibration\so101_new_calib.urdf"
 FPS             = 60
 
-ARM_JOINTS  = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll"]
-MOTOR_NAMES = ARM_JOINTS + ["gripper"]
+ARM_JOINTS  = ["shoulder_pan", "shoulder_lift", "elbow_flex"]
+MOTOR_NAMES = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"]
 JOINT_INDEX = {name: i for i, name in enumerate(MOTOR_NAMES)}
+
+FIXED_WRIST_ROLL_DEG = -90.0  # held constant; not IK-controlled
 
 WS_MIN     = np.array([-0.35, -0.35, -0.10])
 WS_MAX     = np.array([ 0.35,  0.35,  0.50])
@@ -128,6 +130,7 @@ class SO101Kinematics:
         self.joints        = self._load_joints(Path(urdf_path))
         self.chain         = self._chain_to_target()
         self.active_joints = [n for n in ARM_JOINTS if n in self.joints]
+        self.fixed_wrist_flex_deg = self._compute_fixed_wrist_flex()
 
     @staticmethod
     def _load_joints(path: Path) -> dict[str, JointSpec]:
@@ -168,6 +171,15 @@ class SO101Kinematics:
             link = joint.parent
         chain.reverse()
         return chain
+
+    def _compute_fixed_wrist_flex(self) -> float:
+        spec = self.joints.get("wrist_flex")
+        if spec and spec.lower is not None and spec.upper is not None:
+            lo  = math.degrees(spec.lower)
+            hi  = math.degrees(spec.upper)
+            mid = 0.5 * (lo + hi)
+            return 0.5 * (hi + mid)  # midpoint between upper limit and range centre
+        return 0.0
 
     def forward_kinematics(self, joint_pos_deg: np.ndarray) -> np.ndarray:
         """Returns 4×4 EE transform. Matches move_to_position_new.py exactly."""
@@ -434,6 +446,8 @@ def smooth_move(robot, kin: SO101Kinematics, target_pos: np.ndarray) -> dict:
     dt      = 1.0 / FPS
     obs     = robot.get_observation()
     q_start = kin.clip_joints(_joints_from_obs(obs))
+    q_start[JOINT_INDEX["wrist_flex"]] = kin.fixed_wrist_flex_deg
+    q_start[JOINT_INDEX["wrist_roll"]] = FIXED_WRIST_ROLL_DEG
     p_start = kin.forward_kinematics(q_start)[:3, 3].copy()
 
     target   = _clamp_target(np.asarray(target_pos, dtype=float), p_start)
@@ -474,7 +488,9 @@ def smooth_move(robot, kin: SO101Kinematics, target_pos: np.ndarray) -> dict:
         q_cmd = kin.clip_joints(q_cmd)
 
         action = {f"{name}.pos": float(q_cmd[index]) for index, name in enumerate(MOTOR_NAMES)}
-        action["gripper.pos"] = float(obs["gripper.pos"])
+        action["gripper.pos"]    = float(obs["gripper.pos"])
+        action["wrist_flex.pos"] = kin.fixed_wrist_flex_deg
+        action["wrist_roll.pos"] = FIXED_WRIST_ROLL_DEG
         robot.send_action(action)
 
         final_error_m   = float(info["final_error_m"])
