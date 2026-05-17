@@ -52,9 +52,11 @@ from move_to_position_qp import (  # noqa: E402
 from press_key_pnp import (  # noqa: E402
     detect_keys,
     press_key,
+    find_kb_home,
     ROBOFLOW_API_KEY,
     INTERMEDIATE_OFFSET_M,
     HOVER_OFFSET_M,
+    KB_HOME_HEIGHT_M,
 )
 from keyboard_pnp import (  # noqa: E402
     detections_from_roboflow,
@@ -240,9 +242,29 @@ class KeyboardPressGUI:
         t.start()
 
     def _home_worker(self) -> None:
-        self._status = "Returning to home …"
+        self._status = "Returning to reset home …"
         smooth_move(self.robot, self.kin, self._home)
-        self._status = "At home"
+        self._status = "At reset home"
+
+    def _go_kb_home(self) -> None:
+        self._cancel()
+        with self._press_lock:
+            self._cancel_evt.clear()
+            t = threading.Thread(target=self._kb_home_worker, daemon=True)
+            self._press_thread = t
+        t.start()
+
+    def _kb_home_worker(self) -> None:
+        self._status = "Moving to keyboard home …"
+        try:
+            pos = find_kb_home(self.robot, self.kin,
+                               lambda: self._get_frame(fresh=True))
+            smooth_move(self.robot, self.kin, pos)
+            self._status = (f"At keyboard home  "
+                            f"({pos[0]:+.3f}, {pos[1]:+.3f}, {pos[2]:+.3f}) m  "
+                            f"[{KB_HOME_HEIGHT_M*100:.0f} cm above keyboard]")
+        except Exception as exc:
+            self._status = f"KB_HOME failed: {exc}"
 
     # ── Drawing ───────────────────────────────────────────────────────────────
 
@@ -320,7 +342,7 @@ class KeyboardPressGUI:
                     cv2.FONT_HERSHEY_SIMPLEX, 0.50, (255, 255, 255), 1, cv2.LINE_AA)
         cv2.putText(
             frame,
-            f"click=press  right-click=cancel  r=home  o=PnP overlay  q=quit  "
+            f"click=press  right-click=cancel  h=KB_home  r=reset  o=overlay  q=quit  "
             f"observe={INTERMEDIATE_OFFSET_M*100:.0f}cm → hover={HOVER_OFFSET_M*100:.0f}cm",
             (8, h - bar_h + 40),
             cv2.FONT_HERSHEY_SIMPLEX, 0.33, (160, 220, 160), 1, cv2.LINE_AA,
@@ -337,9 +359,10 @@ class KeyboardPressGUI:
         print(f"{'─' * 55}")
         print("  SO-101 Keyboard Press GUI  [PnP mode]")
         print(f"  Camera {CAMERA_INDEX}  {CAMERA_WIDTH}x{CAMERA_HEIGHT}")
-        print(f"  Hover offset : {HOVER_OFFSET_M*100:.0f} cm above PnP surface")
-        print("  Click a detected key box to press it.")
-        print("  Press [o] to toggle PnP overlay.")
+        print(f"  [h] Go to keyboard home ({KB_HOME_HEIGHT_M*100:.0f} cm above keyboard centre)")
+        print( "  [r] Return to reset home")
+        print( "  Click a detected key to press it.")
+        print( "  [o] Toggle PnP overlay  |  [q/Esc] Quit")
         print(f"{'─' * 55}\n")
 
         while True:
@@ -362,6 +385,8 @@ class KeyboardPressGUI:
                 continue
             if key & 0xFF in (ord("q"), 27):
                 break
+            elif key & 0xFF == ord("h"):
+                self._go_kb_home()
             elif key & 0xFF == ord("r") or key == _KEY_HOME:
                 self._go_home()
             elif key & 0xFF == ord("o"):

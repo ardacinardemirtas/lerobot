@@ -183,6 +183,55 @@ def _normalize(label: str) -> str:
     return _ALIASES.get(s, s)
 
 
+# ─── Keyboard pose cache ──────────────────────────────────────────────────────
+#
+# The keyboard is static.  Once we have one good PnP solve we store
+# T_base_keyboard (keyboard frame → robot base frame) and reuse it whenever a
+# fresh solve is poor (high reproj, NaN, or too few inliers).
+# Call reset_keyboard_cache() if the keyboard has physically moved.
+
+_T_base_keyboard_cache: Optional[np.ndarray] = None
+_cache_reproj_px: float = float("inf")
+_CACHE_UPDATE_MAX_PX: float = 5.0   # use fresh solve directly when reproj < this
+
+
+def _positions_from_T(T_base_keyboard: np.ndarray) -> Dict[str, np.ndarray]:
+    """Project all LAYOUT keys through T_base_keyboard into robot base frame."""
+    positions: Dict[str, np.ndarray] = {}
+    for label, (x_m, y_m) in LAYOUT.items():
+        p_kboard = np.array([x_m, 0.0, y_m, 1.0])
+        positions[label] = (T_base_keyboard @ p_kboard)[:3].copy()
+    return positions
+
+
+def reset_keyboard_cache() -> None:
+    """Discard the cached keyboard pose (call after the keyboard has been moved)."""
+    global _T_base_keyboard_cache, _cache_reproj_px
+    _T_base_keyboard_cache = None
+    _cache_reproj_px = float("inf")
+    print("[PnP cache] cleared")
+
+
+def get_keyboard_home_position(height_above_surface_m: float = 0.15) -> Optional[np.ndarray]:
+    """
+    Return the robot base frame XYZ above the centre of the keyboard, at
+    height_above_surface_m above the keyboard surface.
+
+    Returns None if no cached keyboard pose is available yet.
+    From this position the camera sees the whole keyboard from above, giving
+    maximum key correspondences for a robust PnP.
+    """
+    if _T_base_keyboard_cache is None:
+        return None
+    # Centre of the QWERTZ main block in keyboard frame (Y/Z convention: y=0 surface)
+    cx = 7.5 * _P   # mid-column (~14 columns wide)
+    cz = 2.0 * _P   # mid-row    (~4 rows tall)
+    p_kboard = np.array([cx, 0.0, cz, 1.0])
+    p_base = (_T_base_keyboard_cache @ p_kboard)[:3].copy()
+    p_base[2] += height_above_surface_m
+    return p_base
+
+
 # ─── Public helpers ───────────────────────────────────────────────────────────
 
 def detections_from_roboflow(preds: list[dict]) -> Dict[str, Tuple[float, float]]:
@@ -206,7 +255,7 @@ def solve_keyboard_pose(
     detections: Dict[str, Tuple[float, float]],
     camera_k: np.ndarray,
     dist_coeffs: np.ndarray,
-    min_points: int = 6,
+    min_points: int = 4,
     ransac_px: float = 5.0,
 ) -> Tuple[np.ndarray, np.ndarray, float, List[str]]:
     """
@@ -239,7 +288,7 @@ def solve_keyboard_pose(
         key = _normalize(raw_label)
         if key in LAYOUT:
             x_m, y_m = LAYOUT[key]
-            obj_pts.append([x_m, y_m, 0.0])
+            obj_pts.append([x_m, 0.0, y_m])
             img_pts.append([float(u), float(v)])
             labels.append(key)
 
@@ -279,9 +328,12 @@ def solve_keyboard_pose(
         flags=cv2.SOLVEPNP_ITERATIVE,
     )
 
-    # Reprojection error across *all* matched points (not just inliers)
-    proj, _ = cv2.projectPoints(obj, rvec, tvec, camera_k, dist_coeffs)
-    mean_err = float(np.mean(np.linalg.norm(proj.reshape(-1, 2) - img, axis=1)))
+    # Reprojection error over inliers only — outliers inflate the all-matched
+    # metric even when the solve is accurate, causing the cache to be bypassed.
+    proj_inl, _ = cv2.projectPoints(obj[idx], rvec, tvec, camera_k, dist_coeffs)
+    mean_err = float(np.mean(np.linalg.norm(
+        proj_inl.reshape(-1, 2) - img[idx], axis=1
+    )))
 
     inlier_keys = [labels[i] for i in idx]
     print(
@@ -314,23 +366,42 @@ def get_key_positions_in_base_frame(
                   for *every* key in the LAYOUT dict (not just detected ones)
     reproj_err  : mean reprojection error (pixels) — quality indicator
     """
-    rvec, tvec, err, _ = solve_keyboard_pose(detections, camera_k, dist_coeffs)
+    global _T_base_keyboard_cache, _cache_reproj_px
 
-    # Build T_cam_keyboard (keyboard frame → camera frame, metres)
+    # ── Try a fresh PnP solve ─────────────────────────────────────────────────
+    try:
+        rvec, tvec, err, _ = solve_keyboard_pose(detections, camera_k, dist_coeffs)
+    except ValueError as exc:
+        if _T_base_keyboard_cache is not None:
+            print(f"  [PnP] solve failed ({exc}), using cached pose "
+                  f"(last reproj={_cache_reproj_px:.2f}px)")
+            return _positions_from_T(_T_base_keyboard_cache), _cache_reproj_px
+        raise
+
+    # ── Build T_base_keyboard from the fresh solve ────────────────────────────
     R, _ = cv2.Rodrigues(rvec)
     T_cam_keyboard = np.eye(4, dtype=np.float64)
     T_cam_keyboard[:3, :3] = R
     T_cam_keyboard[:3, 3]  = tvec.flatten()
-
     T_base_keyboard = T_base_cam @ T_cam_keyboard
 
-    positions: Dict[str, np.ndarray] = {}
-    for label, (x_m, y_m) in LAYOUT.items():
-        p_kboard = np.array([x_m, y_m, 0.0, 1.0])
-        p_base   = T_base_keyboard @ p_kboard
-        positions[label] = p_base[:3].copy()
+    # ── Always keep the best solve seen so far ───────────────────────────────
+    if not np.isnan(err) and err < _cache_reproj_px:
+        _T_base_keyboard_cache = T_base_keyboard.copy()
+        _cache_reproj_px = err
 
-    return positions, err
+    fresh_is_good = not np.isnan(err) and err < _CACHE_UPDATE_MAX_PX
+    if fresh_is_good:
+        return _positions_from_T(T_base_keyboard), err
+
+    # Fresh solve is poor quality — prefer the cache if available
+    if _T_base_keyboard_cache is not None:
+        print(f"  [PnP] high reproj ({err:.2f}px ≥ {_CACHE_UPDATE_MAX_PX}px), "
+              f"using cached pose (reproj={_cache_reproj_px:.2f}px)")
+        return _positions_from_T(_T_base_keyboard_cache), _cache_reproj_px
+
+    # No cache — return the fresh (poor) result and let the caller decide
+    return _positions_from_T(T_base_keyboard), err
 
 
 def locate_key_in_base_frame(
@@ -386,10 +457,12 @@ def draw_pnp_overlay(
         return frame
 
     # Reproject every layout key
-    obj_all = np.array([[x, y, 0.0] for x, y in LAYOUT.values()], dtype=np.float64)
+    obj_all = np.array([[x, 0.0, y] for x, y in LAYOUT.values()], dtype=np.float64)
     proj, _ = cv2.projectPoints(obj_all, rvec, tvec, camera_k, dist_coeffs)
     h, w = frame.shape[:2]
     for label, pt in zip(LAYOUT.keys(), proj.reshape(-1, 2)):
+        if np.isnan(pt[0]) or np.isnan(pt[1]):
+            continue
         u, v = int(pt[0]), int(pt[1])
         if 0 <= u < w and 0 <= v < h:
             cv2.circle(frame, (u, v), 4, (0, 220, 60), -1, cv2.LINE_AA)

@@ -82,10 +82,15 @@ from keyboard_pnp import (  # noqa: E402
     detections_from_roboflow,
     get_key_positions_in_base_frame,
     locate_key_in_base_frame,
+    get_keyboard_home_position,
 )
 from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
+
+# Height above the keyboard centre for the dedicated "keyboard home" position.
+# From here the whole keyboard fits in frame for maximum PnP correspondences.
+KB_HOME_HEIGHT_M = 0.22
 
 # Step 1: height above the key for the intermediate observation position.
 # High enough to see the full keyboard top-down (good PnP), far from the key.
@@ -117,7 +122,11 @@ MODEL_ID         = os.environ.get("ROBOFLOW_MODEL_ID", "keyboard-key-recognition
 CONF_THRESHOLD   = 0.50
 
 # Minimum PnP inliers required to trust a pose estimate
-MIN_PNP_INLIERS = 6
+MIN_PNP_INLIERS = 4
+
+# If reproj error exceeds this AND no cached keyboard pose is available,
+# the estimate is too uncertain — abort before moving the arm.
+MAX_REPROJ_ACCEPT_PX = 5.0
 
 # ─── Detection ────────────────────────────────────────────────────────────────
 
@@ -164,9 +173,14 @@ def _move(
     pid: bool = False,
     cancel_event: threading.Event | None = None,
 ) -> str:
-    smooth_move(robot, kin, target)
+    result = smooth_move(robot, kin, target)
     if cancel_event is not None and cancel_event.is_set():
         return "cancelled"
+    if not result["success"] and result["final_error_mm"] > 20.0:
+        raise RuntimeError(
+            f"Move failed: arm stuck {result['final_error_mm']:.1f} mm from target "
+            "(target may be outside reachable workspace)."
+        )
     return "done"
 
 
@@ -219,7 +233,7 @@ def _press_down(
 
         # Z-only Jacobian step — drives arm straight down, no XY correction
         # so the end-effector cannot drift forward during the press.
-        z_correction = np.array([0.0, 0.0, np.clip(z_err, -0.0015, 0.0015)])
+        z_correction = np.array([0.0, 0.0, np.clip(z_err, -0.003, 0.003)])
         J = kin.position_jacobian(q, kin.active_joints)
         lam_sq = 0.0025
         J_damp = J.T @ np.linalg.inv(J @ J.T + lam_sq * np.eye(3))
@@ -271,6 +285,13 @@ def _pnp_key_position(
     )
     print(f"  [{step_label}] PnP reproj error: {reproj_err:.2f} px")
 
+    if reproj_err > MAX_REPROJ_ACCEPT_PX:
+        raise ValueError(
+            f"[{step_label}] PnP reprojection error {reproj_err:.2f} px "
+            f"exceeds {MAX_REPROJ_ACCEPT_PX} px and no cached pose is available. "
+            "Move to a position where more keys are visible and try again."
+        )
+
     from keyboard_pnp import _normalize
     canonical = _normalize(target_key)
     if canonical not in positions:
@@ -284,7 +305,49 @@ def _pnp_key_position(
     return key_pos
 
 
-# ─── Two-step press ───────────────────────────────────────────────────────────
+# ─── Keyboard home ───────────────────────────────────────────────────────────
+
+def find_kb_home(
+    robot: SO101Follower,
+    kin: SO101Kinematics,
+    get_frame,
+) -> np.ndarray:
+    """
+    Return the robot base frame position above the keyboard centre at
+    KB_HOME_HEIGHT_M.  Uses the cached keyboard pose when available; otherwise
+    runs a fresh detection from the current arm position to build the cache.
+
+    Raises RuntimeError if the keyboard cannot be located.
+    """
+    pos = get_keyboard_home_position(KB_HOME_HEIGHT_M)
+    if pos is not None:
+        print(f"  [KB_HOME] cached → ({pos[0]:+.4f}, {pos[1]:+.4f}, {pos[2]:+.4f}) m")
+        return np.clip(pos, WS_MIN, WS_MAX)
+
+    # Cache is empty — run one detection to populate it.
+    frame = get_frame()
+    if frame is None:
+        raise RuntimeError("KB_HOME: camera read failed.")
+    T_bc  = _T_base_cam(robot, kin)
+    preds = detect_keys(frame, FINE_CONF_THRESHOLD)
+    dets  = detections_from_roboflow(preds)
+    if dets:
+        try:
+            get_key_positions_in_base_frame(dets, T_bc, CAMERA_K, DIST_COEFFS)
+        except ValueError:
+            pass
+
+    pos = get_keyboard_home_position(KB_HOME_HEIGHT_M)
+    if pos is None:
+        raise RuntimeError(
+            "KB_HOME: keyboard not found. Move to a position where the "
+            "keyboard is visible and try again."
+        )
+    print(f"  [KB_HOME] detected → ({pos[0]:+.4f}, {pos[1]:+.4f}, {pos[2]:+.4f}) m")
+    return np.clip(pos, WS_MIN, WS_MAX)
+
+
+# ─── Three-step press ─────────────────────────────────────────────────────────
 
 def press_key(
     target_key: str,
@@ -347,7 +410,7 @@ def press_key(
 
     # ── Step 2: Hover — re-detect from top-down view, move to hover height ───
     print(f"\n[Step 2/3 — hover]    Re-detecting '{target_key}' from top-down view …")
-    time.sleep(0.4)   # let arm vibration damp out
+    time.sleep(0.2)   # let arm vibration damp out
 
     frame = get_frame()
     if frame is None:
@@ -373,7 +436,7 @@ def press_key(
 
     # ── Step 3: Press — stall-detecting Z-only descent ───────────────────────
     print(f"\n[Step 3/3 — press]    Pressing '{target_key}' …")
-    time.sleep(0.15)  # brief settle before descent
+    time.sleep(0.05)  # brief settle before descent
 
     press_target = np.array([
         key_pos_fine[0],
@@ -389,13 +452,19 @@ def press_key(
     if result == "cancelled":
         return
 
-    # ── Lift ─────────────────────────────────────────────────────────────────
+    # ── Return to KB_HOME ────────────────────────────────────────────────────
     if lift:
-        lift_target    = press_target.copy()
-        lift_target[2] = key_pos_fine[2] + HOVER_OFFSET_M
-        lift_target    = np.clip(lift_target, WS_MIN, WS_MAX)
+        kb_home = get_keyboard_home_position(KB_HOME_HEIGHT_M)
+        if kb_home is not None:
+            lift_target = np.clip(kb_home, WS_MIN, WS_MAX)
+            print(f"  Returning to KB_HOME ({lift_target[0]:+.4f}, "
+                  f"{lift_target[1]:+.4f}, {lift_target[2]:+.4f}) m")
+        else:
+            lift_target    = press_target.copy()
+            lift_target[2] = key_pos_fine[2] + HOVER_OFFSET_M
+            lift_target    = np.clip(lift_target, WS_MIN, WS_MAX)
+            print(f"  Lifting to hover z={lift_target[2]:+.4f} m (no KB_HOME cache)")
         _move(robot, kin, lift_target, cancel_event=cancel_event)
-        print(f"  Lifted to z={lift_target[2]:+.4f} m")
 
     print(f"\nDone — pressed '{target_key}'.")
 

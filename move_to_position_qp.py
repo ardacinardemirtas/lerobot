@@ -49,12 +49,12 @@ MAX_MOVE_M = 0.30
 
 # Controller gains (mirror of ControllerConfig defaults in move_to_position_new.py)
 POSITION_GAIN          = 4.0
-MAX_EE_SPEED_M_S       = 0.080
-TERMINAL_EE_SPEED_M_S  = 0.018
-MIN_DURATION_S         = 0.45
+MAX_EE_SPEED_M_S       = 0.120
+TERMINAL_EE_SPEED_M_S  = 0.025
+MIN_DURATION_S         = 0.30
 MAX_SETTLE_S           = 3.0
 SETTLE_THRESHOLD_M     = 0.0020
-STABLE_TICKS           = 8
+STABLE_TICKS           = 5
 SINGULAR_THRESHOLD     = 0.035
 SINGULAR_DAMPING_GAIN  = 0.60
 POSTURE_GAIN           = 0.18
