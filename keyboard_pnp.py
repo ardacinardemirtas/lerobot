@@ -212,6 +212,18 @@ def reset_keyboard_cache() -> None:
     print("[PnP cache] cleared")
 
 
+def get_keyboard_center_world() -> Optional[np.ndarray]:
+    """
+    Return the keyboard surface centre in robot base frame (metres).
+    Returns None if no cached keyboard pose is available yet.
+    """
+    if _T_base_keyboard_cache is None:
+        return None
+    cx = 7.5 * _P
+    cz = 2.0 * _P
+    return (_T_base_keyboard_cache @ np.array([cx, 0.0, cz, 1.0]))[:3].copy()
+
+
 def get_keyboard_home_position(height_above_surface_m: float = 0.15) -> Optional[np.ndarray]:
     """
     Return the robot base frame XYZ above the centre of the keyboard, at

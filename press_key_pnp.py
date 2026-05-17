@@ -83,6 +83,7 @@ from keyboard_pnp import (  # noqa: E402
     get_key_positions_in_base_frame,
     locate_key_in_base_frame,
     get_keyboard_home_position,
+    get_keyboard_center_world,
 )
 from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
 
@@ -231,13 +232,15 @@ def _press_down(
                       f"z_residual={abs(z_err)*1000:.1f}mm")
                 return "contact"
 
-        # Z-only Jacobian step — drives arm straight down, no XY correction
-        # so the end-effector cannot drift forward during the press.
-        z_correction = np.array([0.0, 0.0, np.clip(z_err, -0.003, 0.003)])
+        # Descend in Z while actively correcting XY drift so the EE stays
+        # directly over the key and cannot slide forward/sideways during press.
+        xy_err  = target_pos[:2] - p[:2]
+        xy_step = np.clip(xy_err * 5.0, -0.001, 0.001)
+        correction = np.array([xy_step[0], xy_step[1], np.clip(z_err, -0.003, 0.003)])
         J = kin.position_jacobian(q, kin.active_joints)
         lam_sq = 0.0025
         J_damp = J.T @ np.linalg.inv(J @ J.T + lam_sq * np.eye(3))
-        delta_q_deg = np.degrees(J_damp @ z_correction)
+        delta_q_deg = np.degrees(J_damp @ correction)
         for i, name in enumerate(kin.active_joints):
             q[JOINT_INDEX[name]] += delta_q_deg[i]
         q = kin.clip_joints(q)
@@ -305,46 +308,193 @@ def _pnp_key_position(
     return key_pos
 
 
+# ─── Wrist / joint helpers ────────────────────────────────────────────────────
+
+# Wrist-flex angle found by the last find_kb_home() call.
+# _tilt_to_look_down() reapplies it after every return to KB_HOME.
+_kb_home_wrist_flex_deg: float = 0.0
+
+
+def _apply_wrist_flex(robot: SO101Follower, target_flex_deg: float,
+                      n_steps: int = 25) -> None:
+    """Smoothly move wrist_flex to target_flex_deg, holding all other joints."""
+    obs        = robot.get_observation()
+    start_flex = float(obs["wrist_flex.pos"])
+    if abs(start_flex - target_flex_deg) < 2.0:
+        return
+    gripper = float(obs["gripper.pos"])
+    dt = 1.0 / FPS
+    for i in range(n_steps):
+        t0    = time.perf_counter()
+        alpha = (i + 1) / n_steps
+        flex  = start_flex + alpha * (target_flex_deg - start_flex)
+        action = {
+            "shoulder_pan.pos":  float(obs["shoulder_pan.pos"]),
+            "shoulder_lift.pos": float(obs["shoulder_lift.pos"]),
+            "elbow_flex.pos":    float(obs["elbow_flex.pos"]),
+            "wrist_flex.pos":    flex,
+            "wrist_roll.pos":    FIXED_WRIST_ROLL_DEG,
+            "gripper.pos":       gripper,
+        }
+        robot.send_action(action)
+        time.sleep(max(dt - (time.perf_counter() - t0), 0.0))
+
+
+def _tilt_to_look_down(robot: SO101Follower) -> None:
+    """Re-apply the wrist_flex angle discovered by find_kb_home()."""
+    _apply_wrist_flex(robot, _kb_home_wrist_flex_deg)
+
+
+def _move_to_joints(robot: SO101Follower, q_target_deg: np.ndarray,
+                    duration: float = 3.0) -> None:
+    """Joint-space move with minimum-jerk interpolation."""
+    obs     = robot.get_observation()
+    q_start = _joints_from_obs(obs)
+    q_tgt   = np.asarray(q_target_deg, dtype=float)
+    gripper = float(obs["gripper.pos"])
+    dt      = 1.0 / FPS
+    n       = max(1, int(duration * FPS))
+    for i in range(n):
+        t0  = time.perf_counter()
+        tau = (i + 1) / n
+        s   = 10*tau**3 - 15*tau**4 + 6*tau**5   # minimum-jerk
+        q   = q_start + s * (q_tgt - q_start)
+        action = {
+            "shoulder_pan.pos":  float(q[JOINT_INDEX["shoulder_pan"]]),
+            "shoulder_lift.pos": float(q[JOINT_INDEX["shoulder_lift"]]),
+            "elbow_flex.pos":    float(q[JOINT_INDEX["elbow_flex"]]),
+            "wrist_flex.pos":    float(q[JOINT_INDEX["wrist_flex"]]),
+            "wrist_roll.pos":    FIXED_WRIST_ROLL_DEG,
+            "gripper.pos":       gripper,
+        }
+        robot.send_action(action)
+        time.sleep(max(dt - (time.perf_counter() - t0), 0.0))
+
+
+def _find_wrist_flex_for_direction(
+    kin: SO101Kinematics,
+    q: np.ndarray,
+    target_dir: np.ndarray,
+) -> tuple[float, float]:
+    """
+    Scan the wrist_flex joint range and return the angle whose camera optical
+    axis (camera-frame Z in world) best aligns with target_dir.
+
+    Returns (best_wrist_flex_deg, alignment) where alignment is the dot product
+    of the best camera-Z with the normalised target_dir.
+    """
+    spec = kin.joints.get("wrist_flex")
+    lo   = float(np.degrees(spec.lower)) if spec and spec.lower is not None else -90.0
+    hi   = float(np.degrees(spec.upper)) if spec and spec.upper is not None else  90.0
+    t    = np.asarray(target_dir, dtype=float)
+    t   /= max(float(np.linalg.norm(t)), 1e-9)
+
+    best_angle = float(q[JOINT_INDEX["wrist_flex"]])
+    best_dot   = -2.0
+    for angle in np.linspace(lo, hi, 37):   # ≈ 5° steps
+        q_t = q.copy()
+        q_t[JOINT_INDEX["wrist_flex"]] = angle
+        cam_z = (kin.forward_kinematics(q_t) @ T_EE_CAM)[:3, 2]
+        dot   = float(np.dot(cam_z, t))
+        if dot > best_dot:
+            best_dot   = dot
+            best_angle = angle
+    return best_angle, best_dot
+
+
 # ─── Keyboard home ───────────────────────────────────────────────────────────
 
 def find_kb_home(
     robot: SO101Follower,
     kin: SO101Kinematics,
     get_frame,
+    n_refine: int = 3,
 ) -> np.ndarray:
     """
-    Return the robot base frame position above the keyboard centre at
-    KB_HOME_HEIGHT_M.  Uses the cached keyboard pose when available; otherwise
-    runs a fresh detection from the current arm position to build the cache.
+    Find and lock in the KB_HOME position for this run.
 
-    Raises RuntimeError if the keyboard cannot be located.
+    1. Moves arm to HOME_DEG (rough start — tune until keyboard is roughly
+       visible in the camera from that joint configuration).
+    2. Detects the keyboard via PnP and computes the ideal above-keyboard XYZ.
+    3. Moves to that XYZ, then scans all wrist_flex angles to find the one
+       whose camera optical axis points most directly at the keyboard centre.
+    4. Applies the best wrist_flex and repeats (n_refine times) to converge.
+
+    The resulting wrist_flex is stored in _kb_home_wrist_flex_deg and
+    reapplied automatically by _tilt_to_look_down() after every key press.
+
+    Raises RuntimeError if the keyboard is not visible from HOME_DEG.
     """
-    pos = get_keyboard_home_position(KB_HOME_HEIGHT_M)
-    if pos is not None:
-        print(f"  [KB_HOME] cached → ({pos[0]:+.4f}, {pos[1]:+.4f}, {pos[2]:+.4f}) m")
-        return np.clip(pos, WS_MIN, WS_MAX)
+    global _kb_home_wrist_flex_deg
 
-    # Cache is empty — run one detection to populate it.
-    frame = get_frame()
-    if frame is None:
-        raise RuntimeError("KB_HOME: camera read failed.")
-    T_bc  = _T_base_cam(robot, kin)
-    preds = detect_keys(frame, FINE_CONF_THRESHOLD)
-    dets  = detections_from_roboflow(preds)
-    if dets:
+    # ── Step 1: go to rough start ─────────────────────────────────────────────
+    print("  [KB_HOME] Moving to rough start (HOME_DEG) …")
+    _move_to_joints(robot, HOME_DEG, duration=3.0)
+    time.sleep(0.3)
+
+    pos: np.ndarray | None = None
+
+    for iteration in range(n_refine):
+        print(f"  [KB_HOME] Refinement {iteration + 1}/{n_refine} …")
+
+        # ── Detect keyboard ───────────────────────────────────────────────────
+        frame = get_frame()
+        if frame is None:
+            raise RuntimeError("KB_HOME: camera read failed.")
+        T_bc  = _T_base_cam(robot, kin)
+        preds = detect_keys(frame, FINE_CONF_THRESHOLD)
+        dets  = detections_from_roboflow(preds)
+
+        if not dets:
+            raise RuntimeError(
+                "KB_HOME: no keys detected from HOME_DEG. "
+                "Adjust HOME_DEG in click_to_move.py until the keyboard is "
+                "visible in the camera from that position."
+            )
+
         try:
             get_key_positions_in_base_frame(dets, T_bc, CAMERA_K, DIST_COEFFS)
-        except ValueError:
-            pass
+        except ValueError as exc:
+            if iteration == 0:
+                raise RuntimeError(f"KB_HOME: PnP failed ({exc}).") from exc
+            # Later iterations can rely on the cache from the previous pass.
 
-    pos = get_keyboard_home_position(KB_HOME_HEIGHT_M)
-    if pos is None:
-        raise RuntimeError(
-            "KB_HOME: keyboard not found. Move to a position where the "
-            "keyboard is visible and try again."
-        )
-    print(f"  [KB_HOME] detected → ({pos[0]:+.4f}, {pos[1]:+.4f}, {pos[2]:+.4f}) m")
-    return np.clip(pos, WS_MIN, WS_MAX)
+        # ── Compute above-keyboard XYZ ────────────────────────────────────────
+        pos = get_keyboard_home_position(KB_HOME_HEIGHT_M)
+        if pos is None:
+            raise RuntimeError("KB_HOME: could not locate keyboard centre.")
+        pos = np.clip(pos, WS_MIN, WS_MAX)
+        print(f"  [KB_HOME] pos = ({pos[0]:+.4f}, {pos[1]:+.4f}, {pos[2]:+.4f}) m")
+
+        # ── Move to above-keyboard XYZ ────────────────────────────────────────
+        smooth_move(robot, kin, pos)
+        time.sleep(0.15)
+
+        # ── Scan wrist_flex to align camera with keyboard centre ──────────────
+        obs     = robot.get_observation()
+        q       = _joints_from_obs(obs)
+        cam_pos = (kin.forward_kinematics(q) @ T_EE_CAM)[:3, 3]
+
+        kbd_centre = get_keyboard_center_world()
+        target_dir = (kbd_centre - cam_pos) if kbd_centre is not None \
+                     else np.array([0.0, 0.0, -1.0])
+
+        best_flex, alignment = _find_wrist_flex_for_direction(kin, q, target_dir)
+        print(f"  [KB_HOME] wrist_flex = {best_flex:.1f}°  "
+              f"alignment = {alignment:.3f}")
+
+        _apply_wrist_flex(robot, best_flex)
+        _kb_home_wrist_flex_deg = best_flex
+        time.sleep(0.1)
+
+        if alignment > 0.90:
+            print(f"  [KB_HOME] Converged at iteration {iteration + 1}.")
+            break
+
+    assert pos is not None
+    print(f"  [KB_HOME] Locked in: pos=({pos[0]:+.4f}, {pos[1]:+.4f}, "
+          f"{pos[2]:+.4f}) m  wrist_flex={_kb_home_wrist_flex_deg:.1f}°")
+    return pos
 
 
 # ─── Three-step press ─────────────────────────────────────────────────────────
@@ -465,6 +615,8 @@ def press_key(
             lift_target    = np.clip(lift_target, WS_MIN, WS_MAX)
             print(f"  Lifting to hover z={lift_target[2]:+.4f} m (no KB_HOME cache)")
         _move(robot, kin, lift_target, cancel_event=cancel_event)
+        if kb_home is not None:
+            _tilt_to_look_down(robot)   # restore top-down view for next press
 
     print(f"\nDone — pressed '{target_key}'.")
 

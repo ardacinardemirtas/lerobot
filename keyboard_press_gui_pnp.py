@@ -58,6 +58,13 @@ from press_key_pnp import (  # noqa: E402
     HOVER_OFFSET_M,
     KB_HOME_HEIGHT_M,
 )
+
+# Physical QWERTY key → QWERTZ label sent to the robot.
+# On a German (QWERTZ) target keyboard, Y and Z are swapped vs QWERTY.
+_QWERTY_TO_QWERTZ: dict[str, str] = {
+    "y": "z",
+    "z": "y",
+}
 from keyboard_pnp import (  # noqa: E402
     detections_from_roboflow,
     draw_pnp_overlay,
@@ -255,14 +262,13 @@ class KeyboardPressGUI:
         t.start()
 
     def _kb_home_worker(self) -> None:
-        self._status = "Moving to keyboard home …"
+        self._status = "Finding keyboard home (rough start → iterative refine) …"
         try:
             pos = find_kb_home(self.robot, self.kin,
                                lambda: self._get_frame(fresh=True))
-            smooth_move(self.robot, self.kin, pos)
             self._status = (f"At keyboard home  "
                             f"({pos[0]:+.3f}, {pos[1]:+.3f}, {pos[2]:+.3f}) m  "
-                            f"[{KB_HOME_HEIGHT_M*100:.0f} cm above keyboard]")
+                            f"[{KB_HOME_HEIGHT_M*100:.0f} cm above, looking down]")
         except Exception as exc:
             self._status = f"KB_HOME failed: {exc}"
 
@@ -342,7 +348,7 @@ class KeyboardPressGUI:
                     cv2.FONT_HERSHEY_SIMPLEX, 0.50, (255, 255, 255), 1, cv2.LINE_AA)
         cv2.putText(
             frame,
-            f"click=press  right-click=cancel  h=KB_home  r=reset  o=overlay  q=quit  "
+            f"click/key=press  right-click=cancel  h=KB_home  r=reset  o=overlay  q=quit  "
             f"observe={INTERMEDIATE_OFFSET_M*100:.0f}cm → hover={HOVER_OFFSET_M*100:.0f}cm",
             (8, h - bar_h + 40),
             cv2.FONT_HERSHEY_SIMPLEX, 0.33, (160, 220, 160), 1, cv2.LINE_AA,
@@ -383,15 +389,30 @@ class KeyboardPressGUI:
             key = cv2.waitKeyEx(1)
             if key == -1:
                 continue
-            if key & 0xFF in (ord("q"), 27):
+            ch = key & 0xFF
+            if ch in (ord("q"), 27):
                 break
-            elif key & 0xFF == ord("h"):
+            elif ch == ord("h"):
                 self._go_kb_home()
-            elif key & 0xFF == ord("r") or key == _KEY_HOME:
+            elif ch == ord("r") or key == _KEY_HOME:
                 self._go_home()
-            elif key & 0xFF == ord("o"):
+            elif ch == ord("o"):
                 self._show_pnp = not self._show_pnp
                 self._status = f"PnP overlay {'ON' if self._show_pnp else 'OFF'}"
+            # ── Physical keyboard → robot key press ───────────────────────────
+            elif ord("a") <= ch <= ord("z"):
+                label = _QWERTY_TO_QWERTZ.get(chr(ch), chr(ch))
+                self._start_press(label)
+            elif ord("0") <= ch <= ord("9"):
+                self._start_press(chr(ch))
+            elif ch == 32:   # space
+                self._start_press("space")
+            elif ch == 13:   # enter
+                self._start_press("enter")
+            elif ch == 8:    # backspace
+                self._start_press("backspace")
+            elif ch == 9:    # tab
+                self._start_press("tab")
 
         self._cancel()
         self._det.stop()
