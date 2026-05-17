@@ -95,7 +95,15 @@ KB_HOME_HEIGHT_M = 0.22
 
 # Step 1: height above the key for the intermediate observation position.
 # High enough to see the full keyboard top-down (good PnP), far from the key.
-INTERMEDIATE_OFFSET_M = 0.10
+INTERMEDIATE_OFFSET_M = 0.07
+
+# Systematic XY correction applied to every press target to compensate for
+# a fixed physical bias (e.g. camera/EE mounting offset, PnP skew).
+# Positive X = further from robot base, positive Y = left from robot's front.
+# If the arm consistently presses to the LEFT, try increasing KEY_Y_CORRECTION_M
+# in small steps (0.003–0.008 m). If it presses too far forward/back, adjust X.
+KEY_X_CORRECTION_M = 0.0
+KEY_Y_CORRECTION_M = -0.003
 
 # Step 2: height above the key for the final hover before pressing.
 HOVER_OFFSET_M = 0.04
@@ -545,8 +553,8 @@ def press_key(
 
     # Intermediate: directly above the key but high enough for a top-down view.
     obs_target = np.array([
-        key_pos_obs[0],
-        key_pos_obs[1],
+        key_pos_obs[0] + KEY_X_CORRECTION_M,
+        key_pos_obs[1] + KEY_Y_CORRECTION_M,
         key_pos_obs[2] + INTERMEDIATE_OFFSET_M,
     ])
     obs_target = np.clip(obs_target, WS_MIN, WS_MAX)
@@ -560,7 +568,7 @@ def press_key(
 
     # ── Step 2: Hover — re-detect from top-down view, move to hover height ───
     print(f"\n[Step 2/3 — hover]    Re-detecting '{target_key}' from top-down view …")
-    time.sleep(0.2)   # let arm vibration damp out
+    time.sleep(0.10)   # let arm vibration damp out
 
     frame = get_frame()
     if frame is None:
@@ -571,8 +579,8 @@ def press_key(
     )
 
     hover_target = np.array([
-        key_pos_fine[0],
-        key_pos_fine[1],
+        key_pos_fine[0] + KEY_X_CORRECTION_M,
+        key_pos_fine[1] + KEY_Y_CORRECTION_M,
         key_pos_fine[2] + HOVER_OFFSET_M,
     ])
     hover_target = np.clip(hover_target, WS_MIN, WS_MAX)
@@ -586,11 +594,11 @@ def press_key(
 
     # ── Step 3: Press — stall-detecting Z-only descent ───────────────────────
     print(f"\n[Step 3/3 — press]    Pressing '{target_key}' …")
-    time.sleep(0.05)  # brief settle before descent
+    time.sleep(0.02)  # brief settle before descent
 
     press_target = np.array([
-        key_pos_fine[0],
-        key_pos_fine[1],
+        key_pos_fine[0] + KEY_X_CORRECTION_M,
+        key_pos_fine[1] + KEY_Y_CORRECTION_M,
         key_pos_fine[2] - PRESS_BELOW_M,
     ])
     press_target = np.clip(press_target, WS_MIN, WS_MAX)
