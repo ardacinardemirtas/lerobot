@@ -235,7 +235,7 @@ def _press_down(
         # Descend in Z while actively correcting XY drift so the EE stays
         # directly over the key and cannot slide forward/sideways during press.
         xy_err  = target_pos[:2] - p[:2]
-        xy_step = np.clip(xy_err * 5.0, -0.001, 0.001)
+        xy_step = np.clip(xy_err * 25.0, -0.003, 0.003)
         correction = np.array([xy_step[0], xy_step[1], np.clip(z_err, -0.003, 0.003)])
         J = kin.position_jacobian(q, kin.active_joints)
         lam_sq = 0.0025

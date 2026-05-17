@@ -10,9 +10,12 @@ Controls
 --------
     Left-click on a key box    two-step PnP press
     Right-click                cancel in-progress move
-    r / HOME button            return to home position
-    o                          toggle PnP overlay (green reprojected keys)
-    q / Esc                    quit
+    a-z / 0-9                  press that key on the robot keyboard
+    space / enter / backspace / tab   press those keys on the robot keyboard
+    HOME key                   return to reset home position
+    F5                         find keyboard home (iterative PnP)
+    ` (backtick)               toggle PnP overlay (green reprojected keys)
+    Esc                        quit
 """
 
 import os
@@ -72,7 +75,8 @@ from keyboard_pnp import (  # noqa: E402
 from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
 
 _WIN      = "SO-101  Keyboard Press  [PnP]"
-_KEY_HOME = 2359296
+_KEY_HOME = 2359296   # VK_HOME  (0x24 << 16) on Windows
+_KEY_F5   = 7667712   # VK_F5   (0x74 << 16) on Windows
 
 
 # ─── Async detection worker ───────────────────────────────────────────────────
@@ -348,7 +352,7 @@ class KeyboardPressGUI:
                     cv2.FONT_HERSHEY_SIMPLEX, 0.50, (255, 255, 255), 1, cv2.LINE_AA)
         cv2.putText(
             frame,
-            f"click/key=press  right-click=cancel  h=KB_home  r=reset  o=overlay  q=quit  "
+            f"a-z/0-9=press  right-click=cancel  ,=home  .=KB_home  `=overlay  Esc=quit  "
             f"observe={INTERMEDIATE_OFFSET_M*100:.0f}cm → hover={HOVER_OFFSET_M*100:.0f}cm",
             (8, h - bar_h + 40),
             cv2.FONT_HERSHEY_SIMPLEX, 0.33, (160, 220, 160), 1, cv2.LINE_AA,
@@ -365,10 +369,10 @@ class KeyboardPressGUI:
         print(f"{'─' * 55}")
         print("  SO-101 Keyboard Press GUI  [PnP mode]")
         print(f"  Camera {CAMERA_INDEX}  {CAMERA_WIDTH}x{CAMERA_HEIGHT}")
-        print(f"  [h] Go to keyboard home ({KB_HOME_HEIGHT_M*100:.0f} cm above keyboard centre)")
-        print( "  [r] Return to reset home")
-        print( "  Click a detected key to press it.")
-        print( "  [o] Toggle PnP overlay  |  [q/Esc] Quit")
+        print(f"  [F5]  Go to keyboard home ({KB_HOME_HEIGHT_M*100:.0f} cm above keyboard centre)")
+        print( "  [HOME] Return to reset home")
+        print( "  Click a detected key OR press a-z/0-9 to press it on the robot.")
+        print( "  [` ]  Toggle PnP overlay  |  [Esc] Quit")
         print(f"{'─' * 55}\n")
 
         while True:
@@ -390,28 +394,33 @@ class KeyboardPressGUI:
             if key == -1:
                 continue
             ch = key & 0xFF
-            if ch in (ord("q"), 27):
+            # ── Non-letter shortcuts (never conflict with robot key presses) ──
+            if ch == 27:                          # Esc = quit
                 break
-            elif ch == ord("h"):
-                self._go_kb_home()
-            elif ch == ord("r") or key == _KEY_HOME:
+            elif ch == ord(","):                  # , = reset home
                 self._go_home()
-            elif ch == ord("o"):
+            elif ch == ord("."):                  # . = keyboard home
+                self._go_kb_home()
+            elif key == _KEY_HOME:                # HOME key = reset home
+                self._go_home()
+            elif key == _KEY_F5:                  # F5 = keyboard home
+                self._go_kb_home()
+            elif ch == 96:                        # ` (backtick) = overlay
                 self._show_pnp = not self._show_pnp
                 self._status = f"PnP overlay {'ON' if self._show_pnp else 'OFF'}"
-            # ── Physical keyboard → robot key press ───────────────────────────
+            # ── Physical keyboard → robot key press (all a-z and 0-9) ────────
             elif ord("a") <= ch <= ord("z"):
                 label = _QWERTY_TO_QWERTZ.get(chr(ch), chr(ch))
                 self._start_press(label)
             elif ord("0") <= ch <= ord("9"):
                 self._start_press(chr(ch))
-            elif ch == 32:   # space
+            elif ch == 32:                        # space
                 self._start_press("space")
-            elif ch == 13:   # enter
+            elif ch == 13:                        # enter
                 self._start_press("enter")
-            elif ch == 8:    # backspace
+            elif ch == 8:                         # backspace
                 self._start_press("backspace")
-            elif ch == 9:    # tab
+            elif ch == 9:                         # tab
                 self._start_press("tab")
 
         self._cancel()
