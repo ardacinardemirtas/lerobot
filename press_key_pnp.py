@@ -102,8 +102,8 @@ INTERMEDIATE_OFFSET_M = 0.07
 # Positive X = further from robot base, positive Y = left from robot's front.
 # If the arm consistently presses to the LEFT, try increasing KEY_Y_CORRECTION_M
 # in small steps (0.003–0.008 m). If it presses too far forward/back, adjust X.
-KEY_X_CORRECTION_M = 0.0
-KEY_Y_CORRECTION_M = -0.003
+KEY_X_CORRECTION_M = 0.004
+KEY_Y_CORRECTION_M = -0.005
 
 # Step 2: height above the key for the final hover before pressing.
 HOVER_OFFSET_M = 0.04
@@ -115,7 +115,7 @@ FINE_CONF_THRESHOLD = 0.35
 
 # How far below the PnP-derived key-top surface to aim for the press.
 # Stall detection stops descent at key contact regardless of this value.
-PRESS_BELOW_M = 0.003
+PRESS_BELOW_M = 0.002
 
 # Press-settle stall detection
 # If the EE moves less than STALL_MIN_M over STALL_WINDOW consecutive steps
