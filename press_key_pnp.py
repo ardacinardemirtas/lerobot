@@ -506,26 +506,7 @@ def find_kb_home(
         q_wrist[JOINT_INDEX["wrist_flex"]] = best_flex
         _move_to_joints(robot, q_wrist, duration=1.5)
         _kb_home_wrist_flex_deg = best_flex
-
-        # Verify actual camera direction and correct up to 2 times.
-        # Gravity compliance can cause the arm to settle at a slightly different
-        # wrist_flex than commanded; re-scan from the actual state and re-apply.
-        _target_down = np.array([0.0, 0.0, -1.0])
-        for _corr in range(2):
-            time.sleep(0.15)
-            obs_v  = robot.get_observation()
-            q_v    = _joints_from_obs(obs_v)
-            cam_z  = (kin.forward_kinematics(q_v) @ T_EE_CAM)[:3, 2]
-            dot_v  = float(np.dot(cam_z, _target_down))
-            print(f"  [KB_HOME] camera-down check {_corr+1}: dot={dot_v:.3f}")
-            if dot_v > 0.97:
-                alignment = dot_v
-                break
-            best_flex_corr, _ = _find_wrist_flex_for_direction(kin, q_v, _target_down)
-            q_corr = q_v.copy()
-            q_corr[JOINT_INDEX["wrist_flex"]] = best_flex_corr
-            _move_to_joints(robot, q_corr, duration=1.0)
-            _kb_home_wrist_flex_deg = best_flex_corr
+        time.sleep(0.1)
 
         if alignment > 0.98:
             print(f"  [KB_HOME] Converged at iteration {iteration + 1}.")
