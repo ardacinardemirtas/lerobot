@@ -113,7 +113,7 @@ KEY_X_CORRECTION_M = -0.008
 KEY_Y_CORRECTION_M = -0.007
 
 # Step 2: height above the key for the final hover before pressing.
-HOVER_OFFSET_M = 0.04
+HOVER_OFFSET_M = 0.025
 
 # Confidence threshold for fine detection at the intermediate position.
 # Lower than CONF_THRESHOLD because we want as many key correspondences as
@@ -122,14 +122,14 @@ FINE_CONF_THRESHOLD = 0.35
 
 # How far below the PnP-derived key-top surface to aim for the press.
 # Stall detection stops descent at key contact regardless of this value.
-PRESS_BELOW_M = 0.0003
+PRESS_BELOW_M = 0.0
 
 # Press-settle stall detection
 # If the EE moves less than STALL_MIN_M over STALL_WINDOW consecutive steps
 # it has made contact with the key and we stop immediately.
-_STALL_WINDOW   = 3      # ~0.10 s at 30 Hz — detect contact quickly
+_STALL_WINDOW   = 5      # ~0.17 s at 30 Hz — confirm contact reliably
 _STALL_MIN_M    = 0.0003 # < 0.3 mm travel → contact
-_PRESS_MAX_ITER = 40     # hard cap (~1.33 s at 30 Hz)
+_PRESS_MAX_ITER = 50     # hard cap (~1.67 s at 30 Hz)
 
 # Roboflow inference
 INFERENCE_HOST   = os.environ.get("INFERENCE_HOST",    "http://localhost:9001")
@@ -244,10 +244,12 @@ def _press_down(
             if travel < _STALL_MIN_M:
                 return "contact"
 
-        # Pure Z descent — no XY correction to avoid arm sliding forward.
-        # Hover already positions EE over the key; keys are wide enough that
-        # small XY coupling from Z joint motion does not matter.
-        correction = np.array([0.0, 0.0, np.clip(z_err, -0.003, 0.003)])
+        # Z descent with gentle XY correction to counteract joint-coupling drift.
+        # Without this the arm drifts backward ~18 mm during descent and hits
+        # the wrong key row. Step capped at 2 mm to avoid visible sliding.
+        xy_err  = target_pos[:2] - p[:2]
+        xy_step = np.clip(xy_err * 20.0, -0.002, 0.002)
+        correction = np.array([xy_step[0], xy_step[1], np.clip(z_err, -0.003, 0.003)])
         J = kin.position_jacobian(q, kin.active_joints)
         lam_sq = 0.0025
         J_damp = J.T @ np.linalg.inv(J @ J.T + lam_sq * np.eye(3))
