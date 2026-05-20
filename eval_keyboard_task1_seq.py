@@ -20,6 +20,7 @@ Controls
 import os
 import threading
 import time
+import warnings
 from pathlib import Path
 from typing import Optional
 
@@ -518,7 +519,9 @@ def main() -> None:
             f"Add it to  {_ENV_FILE}"
         )
 
-    kin = SO101Kinematics(URDF_PATH)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        kin = SO101Kinematics(URDF_PATH)
 
     robot = SO101Follower(SO101FollowerConfig(
         port=PORT,
