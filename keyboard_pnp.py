@@ -348,10 +348,6 @@ def solve_keyboard_pose(
     )))
 
     inlier_keys = [labels[i] for i in idx]
-    print(
-        f"[PnP]  matched={n}  inliers={len(idx)}  "
-        f"reproj={mean_err:.2f}px  keys={inlier_keys}"
-    )
     return rvec, tvec, mean_err, inlier_keys
 
 

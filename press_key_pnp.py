@@ -242,9 +242,6 @@ def _press_down(
         if len(p_history) == _STALL_WINDOW:
             travel = float(np.linalg.norm(p_history[-1] - p_history[0]))
             if travel < _STALL_MIN_M:
-                print(f"  [press] Key contact  "
-                      f"travel={travel*1000:.2f}mm / {_STALL_WINDOW} steps  "
-                      f"z_residual={abs(z_err)*1000:.1f}mm")
                 return "contact"
 
         # Descend in Z while actively correcting XY drift so the EE stays
@@ -286,13 +283,9 @@ def _pnp_key_position(
     frame even if the API call takes several seconds.
     Raises ValueError if detection or PnP fails.
     """
-    # Read FK now, while the arm is settled and the frame was just captured.
     T_bc = _T_base_cam(robot, kin)
 
-    t0    = time.perf_counter()
     preds = detect_keys(frame, conf)
-    print(f"  [{step_label}] Detection: {len(preds)} objects in "
-          f"{(time.perf_counter()-t0)*1000:.0f} ms")
 
     dets = detections_from_roboflow(preds)
     if not dets:
@@ -301,7 +294,6 @@ def _pnp_key_position(
     positions, reproj_err = get_key_positions_in_base_frame(
         dets, T_bc, CAMERA_K, DIST_COEFFS
     )
-    print(f"  [{step_label}] PnP reproj error: {reproj_err:.2f} px")
 
     if reproj_err > MAX_REPROJ_ACCEPT_PX:
         raise ValueError(
@@ -317,10 +309,7 @@ def _pnp_key_position(
             f"[{step_label}] '{target_key}' not in German ISO layout."
         )
 
-    key_pos = positions[canonical]
-    print(f"  [{step_label}] '{target_key}' → "
-          f"({key_pos[0]:+.4f}, {key_pos[1]:+.4f}, {key_pos[2]:+.4f}) m")
-    return key_pos
+    return positions[canonical]
 
 
 # ─── Wrist / joint helpers ────────────────────────────────────────────────────
@@ -570,33 +559,25 @@ def press_key(
     """
 
     # ── Step 1: Observe — PnP from current position, move to intermediate ────
-    print(f"\n[Step 1/3 — observe]  Locating '{target_key}' via PnP …")
     frame = get_frame()
     if frame is None:
         raise RuntimeError("Camera read failed.")
 
-    key_pos_obs = _pnp_key_position(
-        frame, target_key, robot, kin, "observe"
-    )
+    key_pos_obs = _pnp_key_position(frame, target_key, robot, kin, "observe")
 
-    # Intermediate: directly above the key but high enough for a top-down view.
     obs_target = np.array([
         key_pos_obs[0] + KEY_X_CORRECTION_M,
         key_pos_obs[1] + KEY_Y_CORRECTION_M,
         key_pos_obs[2] + INTERMEDIATE_OFFSET_M,
     ])
     obs_target = np.clip(obs_target, WS_MIN, WS_MAX)
-    print(f"  Intermediate target = ({obs_target[0]:+.4f}, {obs_target[1]:+.4f}, "
-          f"{obs_target[2]:+.4f}) m")
 
     result = _move(robot, kin, obs_target, cancel_event=cancel_event)
-    print(f"  Observe move: {result}")
     if result == "cancelled":
         return
 
     # ── Step 2: Hover — re-detect from top-down view, move to hover height ───
-    print(f"\n[Step 2/3 — hover]    Re-detecting '{target_key}' from top-down view …")
-    time.sleep(0.10)   # let arm vibration damp out
+    time.sleep(0.10)
 
     frame = get_frame()
     if frame is None:
@@ -612,17 +593,13 @@ def press_key(
         key_pos_fine[2] + HOVER_OFFSET_M,
     ])
     hover_target = np.clip(hover_target, WS_MIN, WS_MAX)
-    print(f"  Hover target = ({hover_target[0]:+.4f}, {hover_target[1]:+.4f}, "
-          f"{hover_target[2]:+.4f}) m")
 
     result = _move(robot, kin, hover_target, cancel_event=cancel_event)
-    print(f"  Hover move: {result}")
     if result == "cancelled":
         return
 
     # ── Step 3: Press — stall-detecting Z-only descent ───────────────────────
-    print(f"\n[Step 3/3 — press]    Pressing '{target_key}' …")
-    time.sleep(0.02)  # brief settle before descent
+    time.sleep(0.02)
 
     press_target = np.array([
         key_pos_fine[0] + KEY_X_CORRECTION_M,
@@ -630,25 +607,17 @@ def press_key(
         key_pos_fine[2] - PRESS_BELOW_M,
     ])
     press_target = np.clip(press_target, WS_MIN, WS_MAX)
-    print(f"  Press target = ({press_target[0]:+.4f}, {press_target[1]:+.4f}, "
-          f"{press_target[2]:+.4f}) m")
 
     result = _press_down(robot, kin, press_target, cancel_event)
-    print(f"  Press result: {result}")
     if result == "cancelled":
         return
 
     # ── Return to KB_HOME (reverse path) ─────────────────────────────────────
     if lift:
-        # Retrace the forward path in reverse: press → hover → obs → kb_home.
-        # This lifts straight up above the key before any horizontal movement,
-        # keeping the return trajectory safe and deterministic.
-        print(f"  [lift 1/3] press → hover")
         result = _move(robot, kin, hover_target, cancel_event=cancel_event)
         if result == "cancelled":
             return
 
-        print(f"  [lift 2/3] hover → obs")
         result = _move(robot, kin, obs_target, cancel_event=cancel_event)
         if result == "cancelled":
             return
@@ -656,22 +625,13 @@ def press_key(
         kb_home = get_keyboard_home_position(KB_HOME_HEIGHT_M)
         if kb_home is not None:
             lift_target = np.clip(kb_home, WS_MIN, WS_MAX)
-            print(f"  [lift 3/3] obs → KB_HOME ({lift_target[0]:+.4f}, "
-                  f"{lift_target[1]:+.4f}, {lift_target[2]:+.4f}) m")
             result = _move(robot, kin, lift_target, cancel_event=cancel_event)
             if result == "cancelled":
                 return
-            # Restore exact joint config from find_kb_home() — guarantees the
-            # camera returns to the same look-down orientation every time.
             if _kb_home_q_deg is not None:
                 _move_to_joints(robot, _kb_home_q_deg, duration=1.0)
             else:
                 _tilt_to_look_down(robot)
-        else:
-            # No KB_HOME cache — just stay at obs height above the key.
-            print(f"  [lift 3/3] no KB_HOME cache, holding at obs position")
-
-    print(f"\nDone — pressed '{target_key}'.")
 
 
 # ─── Entry point ──────────────────────────────────────────────────────────────
