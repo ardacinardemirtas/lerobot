@@ -83,7 +83,6 @@ from keyboard_pnp import (  # noqa: E402
     get_key_positions_in_base_frame,
     locate_key_in_base_frame,
     get_keyboard_home_position,
-    get_keyboard_center_world,
 )
 from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
 
@@ -91,7 +90,15 @@ from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
 
 # Height above the keyboard centre for the dedicated "keyboard home" position.
 # From here the whole keyboard fits in frame for maximum PnP correspondences.
-KB_HOME_HEIGHT_M = 0.22
+KB_HOME_HEIGHT_M = 0.26
+
+# XY offset applied to the keyboard-centre position when computing KB_HOME.
+# Positive X = further from robot base (toward keyboard / forward).
+# Positive Y = left from robot's front.
+# Tune these so the arm is well-extended in the forward direction at KB_HOME,
+# giving the IK enough freedom to press keys without changing wrist orientation.
+KB_HOME_X_OFFSET_M = 0.05
+KB_HOME_Y_OFFSET_M = 0.0
 
 # Step 1: height above the key for the intermediate observation position.
 # High enough to see the full keyboard top-down (good PnP), far from the key.
@@ -318,9 +325,10 @@ def _pnp_key_position(
 
 # ─── Wrist / joint helpers ────────────────────────────────────────────────────
 
-# Wrist-flex angle found by the last find_kb_home() call.
-# _tilt_to_look_down() reapplies it after every return to KB_HOME.
+# Full joint config (degrees) at KB_HOME, captured by find_kb_home().
+# Used to restore the exact pose (including look-down wrist) after each press.
 _kb_home_wrist_flex_deg: float = 0.0
+_kb_home_q_deg: np.ndarray | None = None
 
 
 def _apply_wrist_flex(robot: SO101Follower, target_flex_deg: float,
@@ -471,6 +479,8 @@ def find_kb_home(
         pos = get_keyboard_home_position(KB_HOME_HEIGHT_M)
         if pos is None:
             raise RuntimeError("KB_HOME: could not locate keyboard centre.")
+        pos[0] += KB_HOME_X_OFFSET_M
+        pos[1] += KB_HOME_Y_OFFSET_M
         pos = np.clip(pos, WS_MIN, WS_MAX)
         print(f"  [KB_HOME] pos = ({pos[0]:+.4f}, {pos[1]:+.4f}, {pos[2]:+.4f}) m")
 
@@ -478,31 +488,48 @@ def find_kb_home(
         smooth_move(robot, kin, pos)
         time.sleep(0.15)
 
-        # ── Scan wrist_flex to align camera with keyboard centre ──────────────
-        obs     = robot.get_observation()
-        q       = _joints_from_obs(obs)
-        cam_pos = (kin.forward_kinematics(q) @ T_EE_CAM)[:3, 3]
+        # ── Find wrist_flex that makes the camera look straight down (world -Z) ─
+        obs = robot.get_observation()
+        q   = _joints_from_obs(obs)
 
-        kbd_centre = get_keyboard_center_world()
-        target_dir = (kbd_centre - cam_pos) if kbd_centre is not None \
-                     else np.array([0.0, 0.0, -1.0])
-
-        best_flex, alignment = _find_wrist_flex_for_direction(kin, q, target_dir)
+        best_flex, alignment = _find_wrist_flex_for_direction(
+            kin, q, np.array([0.0, 0.0, -1.0])
+        )
         print(f"  [KB_HOME] wrist_flex = {best_flex:.1f}°  "
-              f"alignment = {alignment:.3f}")
+              f"cam-down alignment = {alignment:.3f}")
 
-        _apply_wrist_flex(robot, best_flex)
+        # Closed-loop joint-space wrist move (replaces open-loop _apply_wrist_flex).
+        # Must be the LAST step — smooth_move above already corrected XYZ, and any
+        # re-running of smooth_move here would undo the wrist adjustment.
+        q_wrist = q.copy()
+        q_wrist[JOINT_INDEX["wrist_flex"]] = best_flex
+        _move_to_joints(robot, q_wrist, duration=1.5)
         _kb_home_wrist_flex_deg = best_flex
         time.sleep(0.1)
 
-        if alignment > 0.90:
+        if alignment > 0.98:
             print(f"  [KB_HOME] Converged at iteration {iteration + 1}.")
             break
 
     assert pos is not None
+    global _kb_home_q_deg
+    _kb_home_q_deg = _joints_from_obs(robot.get_observation()).copy()
     print(f"  [KB_HOME] Locked in: pos=({pos[0]:+.4f}, {pos[1]:+.4f}, "
           f"{pos[2]:+.4f}) m  wrist_flex={_kb_home_wrist_flex_deg:.1f}°")
     return pos
+
+
+def return_to_kb_home(robot: SO101Follower, duration: float = 2.0) -> bool:
+    """
+    Return to the KB_HOME joint configuration saved by find_kb_home().
+    Uses joint-space interpolation so position and camera-down orientation
+    are both restored reliably without any orientation-vs-position conflict.
+    Returns False (and does nothing) if find_kb_home() has not been called.
+    """
+    if _kb_home_q_deg is None:
+        return False
+    _move_to_joints(robot, _kb_home_q_deg, duration=duration)
+    return True
 
 
 # ─── Three-step press ─────────────────────────────────────────────────────────
@@ -610,21 +637,38 @@ def press_key(
     if result == "cancelled":
         return
 
-    # ── Return to KB_HOME ────────────────────────────────────────────────────
+    # ── Return to KB_HOME (reverse path) ─────────────────────────────────────
     if lift:
+        # Retrace the forward path in reverse: press → hover → obs → kb_home.
+        # This lifts straight up above the key before any horizontal movement,
+        # keeping the return trajectory safe and deterministic.
+        print(f"  [lift 1/3] press → hover")
+        result = _move(robot, kin, hover_target, cancel_event=cancel_event)
+        if result == "cancelled":
+            return
+
+        print(f"  [lift 2/3] hover → obs")
+        result = _move(robot, kin, obs_target, cancel_event=cancel_event)
+        if result == "cancelled":
+            return
+
         kb_home = get_keyboard_home_position(KB_HOME_HEIGHT_M)
         if kb_home is not None:
             lift_target = np.clip(kb_home, WS_MIN, WS_MAX)
-            print(f"  Returning to KB_HOME ({lift_target[0]:+.4f}, "
+            print(f"  [lift 3/3] obs → KB_HOME ({lift_target[0]:+.4f}, "
                   f"{lift_target[1]:+.4f}, {lift_target[2]:+.4f}) m")
+            result = _move(robot, kin, lift_target, cancel_event=cancel_event)
+            if result == "cancelled":
+                return
+            # Restore exact joint config from find_kb_home() — guarantees the
+            # camera returns to the same look-down orientation every time.
+            if _kb_home_q_deg is not None:
+                _move_to_joints(robot, _kb_home_q_deg, duration=1.0)
+            else:
+                _tilt_to_look_down(robot)
         else:
-            lift_target    = press_target.copy()
-            lift_target[2] = key_pos_fine[2] + HOVER_OFFSET_M
-            lift_target    = np.clip(lift_target, WS_MIN, WS_MAX)
-            print(f"  Lifting to hover z={lift_target[2]:+.4f} m (no KB_HOME cache)")
-        _move(robot, kin, lift_target, cancel_event=cancel_event)
-        if kb_home is not None:
-            _tilt_to_look_down(robot)   # restore top-down view for next press
+            # No KB_HOME cache — just stay at obs height above the key.
+            print(f"  [lift 3/3] no KB_HOME cache, holding at obs position")
 
     print(f"\nDone — pressed '{target_key}'.")
 

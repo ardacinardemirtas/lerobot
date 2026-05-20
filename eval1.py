@@ -6,12 +6,13 @@ Sequence : space → enter → r → l
 Scoring  : 12.5 points per key pressed correctly in-order  (max 50)
 Time     : 40 seconds from the moment the run is started
 
-Controls
---------
-    F5        find keyboard home (required before starting)
+Controls (identical to keyboard_press_gui_pnp.py)
+-------------------------------------------------
+    .         find keyboard home (iterative PnP)
     s         START the timed run
-    HOME      return to reset home
-    ` (backtick)   toggle PnP overlay
+    ,         return to reset home
+    HOME key  return to reset home
+    `         toggle PnP overlay
     Esc       quit
 """
 
@@ -65,13 +66,12 @@ from keyboard_pnp import (  # noqa: E402
 from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
 
 # ── Eval definition ───────────────────────────────────────────────────────────
-SEQUENCE      = ["space", "enter", "r", "l"]
+SEQUENCE       = ["space", "enter", "r", "l"]
 POINTS_PER_KEY = 12.5
 TIME_LIMIT_S   = 40.0
 
 _WIN      = "SO-101  Eval-1  [space → enter → r → l]"
 _KEY_HOME = 2359296   # VK_HOME
-_KEY_F5   = 7667712   # VK_F5
 
 
 # ─── Async detection worker (identical to keyboard_press_gui_pnp.py) ──────────
@@ -79,13 +79,13 @@ _KEY_F5   = 7667712   # VK_F5
 class _DetectionWorker(threading.Thread):
     def __init__(self) -> None:
         super().__init__(daemon=True)
-        self._lock       = threading.Lock()
-        self._pending:   Optional[np.ndarray] = None
-        self._preds:     list[dict] = []
-        self._det_fps    = 0.0
-        self._det_err    = ""
-        self._new_frame  = threading.Event()
-        self._stop       = threading.Event()
+        self._lock      = threading.Lock()
+        self._pending:  Optional[np.ndarray] = None
+        self._preds:    list[dict] = []
+        self._det_fps   = 0.0
+        self._det_err   = ""
+        self._new_frame = threading.Event()
+        self._stop      = threading.Event()
 
     def post_frame(self, frame: np.ndarray) -> None:
         with self._lock:
@@ -151,17 +151,17 @@ class Eval1GUI:
         self._show_pnp = True
 
         # ── Eval state ────────────────────────────────────────────────────────
-        self._running      = False   # True while the timed run is in progress
-        self._finished     = False
-        self._start_t      = 0.0
-        self._seq_idx      = 0       # next key to press in SEQUENCE
-        self._score        = 0.0
-        self._status       = "Ready — press [F5] to find keyboard home, then [s] to start"
+        self._running   = False
+        self._finished  = False
+        self._start_t   = 0.0
+        self._seq_idx   = 0
+        self._score     = 0.0
+        self._status    = "Ready — press [.] to find keyboard home, then [s] to start"
 
         self._det = _DetectionWorker()
         self._det.start()
 
-    # ── Frame provider ────────────────────────────────────────────────────────
+    # ── Frame provider (identical to keyboard_press_gui_pnp.py) ───────────────
 
     def _get_frame(self, fresh: bool = False) -> Optional[np.ndarray]:
         if not fresh:
@@ -174,44 +174,7 @@ class Eval1GUI:
                     return self._latest_frame.copy()
             time.sleep(0.005)
 
-    # ── Press machinery ───────────────────────────────────────────────────────
-
-    def _is_pressing(self) -> bool:
-        with self._press_lock:
-            return self._press_thread is not None and self._press_thread.is_alive()
-
-    def _start_press(self, key_label: str, on_done: Optional[callable] = None) -> None:
-        with self._press_lock:
-            if self._press_thread is not None and self._press_thread.is_alive():
-                return
-        self._cancel_evt.clear()
-        with self._press_lock:
-            self._active_key = key_label
-            t = threading.Thread(
-                target=self._press_worker, args=(key_label, on_done), daemon=True
-            )
-            self._press_thread = t
-        t.start()
-
-    def _press_worker(self, key_label: str, on_done: Optional[callable]) -> None:
-        try:
-            press_key(
-                key_label,
-                self.robot,
-                self.kin,
-                lambda: self._get_frame(fresh=True),
-                lift=True,
-                cancel_event=self._cancel_evt,
-            )
-            if on_done and not self._cancel_evt.is_set():
-                on_done(success=True)
-        except Exception as exc:
-            self._status = f"Press error: {exc}"
-            if on_done:
-                on_done(success=False)
-        finally:
-            with self._press_lock:
-                self._active_key = None
+    # ── Cancel (identical to keyboard_press_gui_pnp.py) ───────────────────────
 
     def _cancel(self) -> None:
         self._cancel_evt.set()
@@ -221,7 +184,7 @@ class Eval1GUI:
             t.join(timeout=1.5)
         self._cancel_evt.clear()
 
-    # ── Home / KB home ────────────────────────────────────────────────────────
+    # ── Home / KB home (identical to keyboard_press_gui_pnp.py) ──────────────
 
     def _go_home(self) -> None:
         self._cancel()
@@ -234,7 +197,7 @@ class Eval1GUI:
     def _home_worker(self) -> None:
         self._status = "Returning to reset home …"
         smooth_move(self.robot, self.kin, self._home)
-        self._status = "At reset home — press [F5] to find keyboard home, then [s] to start"
+        self._status = "At reset home — press [.] to find keyboard home, then [s] to start"
 
     def _go_kb_home(self) -> None:
         if self._running:
@@ -250,78 +213,118 @@ class Eval1GUI:
         self._status = "Finding keyboard home …"
         try:
             pos = find_kb_home(self.robot, self.kin, lambda: self._get_frame(fresh=True))
-            self._status = (f"Keyboard home found "
-                            f"({pos[0]:+.3f}, {pos[1]:+.3f}, {pos[2]:+.3f}) m  "
-                            f"— press [s] to START")
+            self._status = (
+                f"Keyboard home found "
+                f"({pos[0]:+.3f}, {pos[1]:+.3f}, {pos[2]:+.3f}) m  "
+                f"— press [s] to start"
+            )
         except Exception as exc:
             self._status = f"KB_HOME failed: {exc}"
 
     # ── Eval run ──────────────────────────────────────────────────────────────
 
     def _start_run(self) -> None:
-        if self._running or self._finished or self._is_pressing():
+        with self._press_lock:
+            if self._press_thread is not None and self._press_thread.is_alive():
+                self._status = "Still moving — wait or cancel first"
+                return
+        if self._running or self._finished:
             return
         self._seq_idx  = 0
         self._score    = 0.0
         self._start_t  = time.monotonic()
         self._running  = True
-        self._finished = False
-        self._status   = f"RUN STARTED — pressing '{SEQUENCE[0]}' …"
-        self._press_next()
+        self._cancel_evt.clear()
+        t = threading.Thread(target=self._run_worker, daemon=True)
+        with self._press_lock:
+            self._press_thread = t
+        t.start()
 
-    def _press_next(self) -> None:
-        if self._seq_idx >= len(SEQUENCE):
-            self._end_run(timed_out=False)
-            return
-        key = SEQUENCE[self._seq_idx]
-        self._status = f"Pressing '{key}'  ({self._seq_idx+1}/{len(SEQUENCE)})  score={self._score:.1f}"
-        self._start_press(key, on_done=self._on_key_done)
+    def _run_worker(self) -> None:
+        """Single thread that presses all keys in sequence, one after another."""
+        for key in SEQUENCE:
+            if self._cancel_evt.is_set():
+                break
 
-    def _on_key_done(self, success: bool) -> None:
-        if not self._running:
-            return
-        elapsed = time.monotonic() - self._start_t
-        if elapsed > TIME_LIMIT_S:
-            self._end_run(timed_out=True)
-            return
-        if success:
-            self._score   += POINTS_PER_KEY
-            self._seq_idx += 1
-            if self._seq_idx >= len(SEQUENCE):
-                self._end_run(timed_out=False)
-            else:
-                self._press_next()
+            elapsed = time.monotonic() - self._start_t
+            if elapsed >= TIME_LIMIT_S:
+                self._end_run(timed_out=True)
+                return
+
+            self._status = f"Pressing '{key}'  ({self._seq_idx + 1}/{len(SEQUENCE)}) …"
+            with self._press_lock:
+                self._active_key = key
+
+            try:
+                press_key(
+                    key,
+                    self.robot,
+                    self.kin,
+                    lambda: self._get_frame(fresh=True),
+                    lift=True,
+                    cancel_event=self._cancel_evt,
+                )
+                if not self._cancel_evt.is_set():
+                    self._score   += POINTS_PER_KEY
+                    self._seq_idx += 1
+                    self._status   = f"Pressed '{key}'"
+            except Exception as exc:
+                self._status = f"Error pressing '{key}': {exc}"
+                with self._press_lock:
+                    self._active_key = None
+                self._running = False
+                return
+            finally:
+                with self._press_lock:
+                    self._active_key = None
+
+            if self._cancel_evt.is_set():
+                break
+
+            elapsed = time.monotonic() - self._start_t
+            if elapsed >= TIME_LIMIT_S:
+                self._end_run(timed_out=True)
+                return
+
+        if self._cancel_evt.is_set():
+            self._running  = False
+            self._finished = True
+            self._status   = f"Cancelled — score = {self._score:.1f}"
         else:
-            self._status = "Press failed — run aborted"
-            self._running = False
+            self._end_run(timed_out=False)
 
     def _end_run(self, timed_out: bool) -> None:
         self._running  = False
         self._finished = True
         elapsed = time.monotonic() - self._start_t
         if timed_out:
-            self._status = (f"TIME OUT after {elapsed:.1f}s  |  "
-                            f"score = {self._score:.1f} / {POINTS_PER_KEY * len(SEQUENCE):.1f}")
+            self._status = (
+                f"TIME OUT after {elapsed:.1f}s  |  "
+                f"score = {self._score:.1f} / {POINTS_PER_KEY * len(SEQUENCE):.1f}"
+            )
         else:
-            self._status = (f"COMPLETE in {elapsed:.1f}s  |  "
-                            f"score = {self._score:.1f} / {POINTS_PER_KEY * len(SEQUENCE):.1f}")
-        print(f"\n{'═'*55}")
+            self._status = (
+                f"COMPLETE in {elapsed:.1f}s  |  "
+                f"score = {self._score:.1f} / {POINTS_PER_KEY * len(SEQUENCE):.1f}"
+            )
+        print(f"\n{'═' * 55}")
         print(f"  EVAL RESULT: {self._status}")
-        print(f"{'═'*55}\n")
+        print(f"{'═' * 55}\n")
 
-    # ── Time-limit watchdog ───────────────────────────────────────────────────
+    # ── Timeout watchdog (called from main loop) ──────────────────────────────
 
     def _check_timeout(self) -> None:
-        if self._running and (time.monotonic() - self._start_t) > TIME_LIMIT_S:
+        if self._running and (time.monotonic() - self._start_t) >= TIME_LIMIT_S:
             self._cancel()
             self._end_run(timed_out=True)
 
-    # ── Drawing ───────────────────────────────────────────────────────────────
+    # ── Drawing (identical structure to keyboard_press_gui_pnp.py) ────────────
 
     def _draw(self, frame: np.ndarray) -> np.ndarray:
         preds, det_fps, det_err = self._det.get_state()
 
         with self._press_lock:
+            moving     = self._press_thread is not None and self._press_thread.is_alive()
             active_key = self._active_key
 
         h, w = frame.shape[:2]
@@ -332,7 +335,8 @@ class Eval1GUI:
             if dets:
                 draw_pnp_overlay(frame, dets, CAMERA_K, DIST_COEFFS)
 
-        # Detection boxes
+        # Detection boxes — cyan highlights the next target key
+        next_key = SEQUENCE[self._seq_idx] if self._seq_idx < len(SEQUENCE) else None
         for p in preds:
             lbl  = p["class"]
             conf = float(p["confidence"])
@@ -341,14 +345,12 @@ class Eval1GUI:
             x1 = int(px - bw / 2);  x2 = int(px + bw / 2)
             y1 = int(py - bh / 2);  y2 = int(py + bh / 2)
 
-            # Highlight the next key in the sequence
-            next_key = SEQUENCE[self._seq_idx] if self._seq_idx < len(SEQUENCE) else None
             if lbl.lower() == "keyboard":
                 color, thick = (0, 165, 255), 2
             elif lbl == active_key:
                 color, thick = (255, 80, 0), 2
             elif lbl == next_key:
-                color, thick = (0, 255, 255), 2   # cyan = next target
+                color, thick = (0, 255, 255), 2
             else:
                 color, thick = (50, 220, 50), 1
 
@@ -363,20 +365,19 @@ class Eval1GUI:
                 cv2.putText(frame, txt, (tx, ty),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 0, 0), 1, cv2.LINE_AA)
 
-        # ── Timer bar (top, full-width) ───────────────────────────────────────
+        # Timer bar (top, full-width)
         if self._running or self._finished:
-            elapsed  = time.monotonic() - self._start_t if self._running else TIME_LIMIT_S
-            fraction = min(elapsed / TIME_LIMIT_S, 1.0)
-            bar_w    = int(w * fraction)
+            elapsed   = time.monotonic() - self._start_t if self._running else TIME_LIMIT_S
+            fraction  = min(elapsed / TIME_LIMIT_S, 1.0)
+            bar_w     = int(w * fraction)
             remaining = max(TIME_LIMIT_S - elapsed, 0.0)
             bar_color = (0, 200, 255) if remaining > 10 else (0, 80, 255)
             cv2.rectangle(frame, (0, 0), (bar_w, 8), bar_color, -1)
             cv2.rectangle(frame, (0, 0), (w - 1, 8), (120, 120, 120), 1)
-            time_txt = f"{remaining:.1f}s"
-            cv2.putText(frame, time_txt, (w - 60, 22),
+            cv2.putText(frame, f"{remaining:.1f}s", (w - 60, 22),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 220, 255), 1, cv2.LINE_AA)
 
-        # ── Score + sequence display (top-left) ───────────────────────────────
+        # Stats (top-left)
         n_keys   = sum(1 for p in preds if p["class"].lower() != "keyboard")
         pnp_flag = "PnP ON" if self._show_pnp else "PnP off"
         if det_err:
@@ -389,35 +390,30 @@ class Eval1GUI:
                 (8, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (200, 255, 200), 1, cv2.LINE_AA,
             )
 
-        # Sequence progress: draw each step with colour coding
+        # Sequence progress
         seq_x = 8
         for i, key in enumerate(SEQUENCE):
             if i < self._seq_idx:
-                col = (0, 220, 0)    # green = done
+                col = (0, 220, 0)
             elif i == self._seq_idx:
-                col = (0, 255, 255)  # cyan  = current
+                col = (0, 255, 255)
             else:
-                col = (160, 160, 160)  # grey  = pending
-            arrow = " → " if i < len(SEQUENCE) - 1 else ""
-            label = f"[{key}]{arrow}"
-            (lw, lh), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.50, 1)
+                col = (160, 160, 160)
+            label = f"[{key}]" + (" → " if i < len(SEQUENCE) - 1 else "")
+            (lw, _), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.50, 1)
             cv2.putText(frame, label, (seq_x, 55),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.50, col, 1, cv2.LINE_AA)
             seq_x += lw + 2
 
-        # Score
-        score_txt = f"score: {self._score:.1f} / {POINTS_PER_KEY * len(SEQUENCE):.1f}"
-        cv2.putText(frame, score_txt, (8, 78),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 220, 80), 1, cv2.LINE_AA)
-
-        # ── Status bar ───────────────────────────────────────────────────────
+        # Status bar
         bar_h = 50
         frame[h - bar_h:] = (frame[h - bar_h:] * 0.35).astype(np.uint8)
         cv2.putText(frame, self._status, (8, h - bar_h + 18),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 1, cv2.LINE_AA)
         cv2.putText(
             frame,
-            f"[F5]=KB home  [s]=start  [HOME]=reset home  [`]=overlay  [Esc]=quit",
+            f"[.]=KB home  [s]=start  [,]=reset home  [`]=overlay  [Esc]=quit  "
+            f"observe={INTERMEDIATE_OFFSET_M*100:.0f}cm → hover={HOVER_OFFSET_M*100:.0f}cm",
             (8, h - bar_h + 40),
             cv2.FONT_HERSHEY_SIMPLEX, 0.33, (160, 220, 160), 1, cv2.LINE_AA,
         )
@@ -435,7 +431,7 @@ class Eval1GUI:
         print(f"  Scoring  : {POINTS_PER_KEY} pts/key  (max {POINTS_PER_KEY * len(SEQUENCE):.0f})")
         print(f"  Time     : {TIME_LIMIT_S:.0f} s")
         print(f"  Camera {CAMERA_INDEX}  {CAMERA_WIDTH}×{CAMERA_HEIGHT}")
-        print( "  [F5]  Find keyboard home first")
+        print( "  [.]   Find keyboard home first")
         print( "  [s]   Start timed run")
         print( "  [` ]  Toggle PnP overlay  |  [Esc] Quit")
         print(f"{'─' * 60}\n")
@@ -462,20 +458,17 @@ class Eval1GUI:
                 continue
             ch = key & 0xFF
 
-            if ch == 27:                    # Esc
+            if ch == 27:                                            # Esc
                 break
             elif ch == ord("s") and not self._running and not self._finished:
                 self._start_run()
-            elif key == _KEY_F5:            # F5 = KB home
+            elif ch == ord("."):                                    # . = KB home
                 self._go_kb_home()
-            elif ch == ord("."):            # . = KB home (alt)
-                self._go_kb_home()
-            elif key == _KEY_HOME:          # HOME = reset home
+            elif ch == ord(",") or key == _KEY_HOME:               # , / HOME = reset home
                 self._go_home()
-            elif ch == ord(","):            # , = reset home (alt)
-                self._go_home()
-            elif ch == 96:                  # ` = PnP overlay
+            elif ch == 96:                                          # ` = overlay
                 self._show_pnp = not self._show_pnp
+                self._status = f"PnP overlay {'ON' if self._show_pnp else 'OFF'}"
 
         self._cancel()
         self._det.stop()
