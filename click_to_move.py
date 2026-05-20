@@ -40,8 +40,8 @@ FPS             = 30
 
 ARM_JOINTS  = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll"]
 MOTOR_NAMES = ARM_JOINTS + ["gripper"]
-WS_MIN      = np.array([-0.35, -0.35, -0.10])
-WS_MAX      = np.array([ 0.35,  0.35,  0.50])
+WS_MIN      = np.array([-0.35, -0.50, -0.10])
+WS_MAX      = np.array([ 0.50,  0.50,  0.80])
 MAX_MOVE_M  = 0.30
 
 ROLL_FIXED_DEG = -90.0   # wrist roll held constant (same as move_to_position_old.py)
