@@ -122,14 +122,14 @@ FINE_CONF_THRESHOLD = 0.35
 
 # How far below the PnP-derived key-top surface to aim for the press.
 # Stall detection stops descent at key contact regardless of this value.
-PRESS_BELOW_M = 0.0007
+PRESS_BELOW_M = 0.0003
 
 # Press-settle stall detection
 # If the EE moves less than STALL_MIN_M over STALL_WINDOW consecutive steps
 # it has made contact with the key and we stop immediately.
-_STALL_WINDOW   = 5      # ~0.08 s at 60 Hz — detect contact quickly
+_STALL_WINDOW   = 3      # ~0.10 s at 30 Hz — detect contact quickly
 _STALL_MIN_M    = 0.0003 # < 0.3 mm travel → contact
-_PRESS_MAX_ITER = 80     # hard cap (~1.3 s)
+_PRESS_MAX_ITER = 40     # hard cap (~1.33 s at 30 Hz)
 
 # Roboflow inference
 INFERENCE_HOST   = os.environ.get("INFERENCE_HOST",    "http://localhost:9001")
@@ -244,11 +244,10 @@ def _press_down(
             if travel < _STALL_MIN_M:
                 return "contact"
 
-        # Descend in Z while actively correcting XY drift so the EE stays
-        # directly over the key and cannot slide forward/sideways during press.
-        xy_err  = target_pos[:2] - p[:2]
-        xy_step = np.clip(xy_err * 25.0, -0.003, 0.003)
-        correction = np.array([xy_step[0], xy_step[1], np.clip(z_err, -0.003, 0.003)])
+        # Pure Z descent — no XY correction to avoid arm sliding forward.
+        # Hover already positions EE over the key; keys are wide enough that
+        # small XY coupling from Z joint motion does not matter.
+        correction = np.array([0.0, 0.0, np.clip(z_err, -0.003, 0.003)])
         J = kin.position_jacobian(q, kin.active_joints)
         lam_sq = 0.0025
         J_damp = J.T @ np.linalg.inv(J @ J.T + lam_sq * np.eye(3))
@@ -285,15 +284,20 @@ def _pnp_key_position(
     """
     T_bc = _T_base_cam(robot, kin)
 
+    _t0 = time.perf_counter()
     preds = detect_keys(frame, conf)
+    _t_detect = time.perf_counter() - _t0
 
     dets = detections_from_roboflow(preds)
     if not dets:
         raise ValueError(f"[{step_label}] No keys detected.")
 
+    _t1 = time.perf_counter()
     positions, reproj_err = get_key_positions_in_base_frame(
         dets, T_bc, CAMERA_K, DIST_COEFFS
     )
+    _t_pnp = time.perf_counter() - _t1
+    print(f"    [TIMING] {step_label}: detect={_t_detect*1000:.0f}ms  pnp={_t_pnp*1000:.0f}ms  reproj={reproj_err:.2f}px  n_dets={len(dets)}", flush=True)
 
     if reproj_err > MAX_REPROJ_ACCEPT_PX:
         raise ValueError(
@@ -509,7 +513,7 @@ def find_kb_home(
     return pos
 
 
-def return_to_kb_home(robot: SO101Follower, duration: float = 2.0) -> bool:
+def return_to_kb_home(robot: SO101Follower, duration: float = 0.8) -> bool:
     """
     Return to the KB_HOME joint configuration saved by find_kb_home().
     Uses joint-space interpolation so position and camera-down orientation
@@ -518,11 +522,13 @@ def return_to_kb_home(robot: SO101Follower, duration: float = 2.0) -> bool:
     """
     if _kb_home_q_deg is None:
         return False
+    _t0 = time.perf_counter()
     _move_to_joints(robot, _kb_home_q_deg, duration=duration)
+    print(f"  [TIMING] return_to_kb_home: {time.perf_counter()-_t0:.2f}s", flush=True)
     return True
 
 
-# ─── Three-step press ─────────────────────────────────────────────────────────
+# ─── Single-detect press ─────────────────────────────────────────────────────
 
 def press_key(
     target_key: str,
@@ -533,20 +539,12 @@ def press_key(
     cancel_event: threading.Event | None = None,
 ) -> None:
     """
-    Three-step PnP key press: observe → hover → press.
+    Single-detect PnP key press: detect at KB_HOME → hover → press → home.
 
-    Step 1  (Observe)
-        PnP from the current position → move to INTERMEDIATE_OFFSET_M above
-        the key.  This gives a near-top-down camera view with the full keyboard
-        visible — ideal geometry for PnP.
-
-    Step 2  (Hover)
-        Stabilise, re-detect with a lower confidence threshold (more keys
-        matched from the top-down view), refine the key position →
-        smooth_move to HOVER_OFFSET_M above the key.
-
-    Step 3  (Press)
-        Z-only stall-detecting Jacobian descent to the key surface.
+    Detect once from KB_HOME (best top-down view), move to hover, then
+    press.  _press_down corrects XY at up to 3 mm/step so a second detect
+    from hover is unnecessary.  After pressing, return directly to KB_HOME
+    via joint-space interpolation — no intermediate Cartesian stop.
 
     Parameters
     ----------
@@ -554,84 +552,71 @@ def press_key(
     robot        : connected SO101Follower
     kin          : SO101Kinematics instance
     get_frame    : callable() → np.ndarray  (camera frame provider)
-    lift         : if True, lift back to hover height after press
+    lift         : if True, lift back to KB_HOME after press
     cancel_event : optional threading.Event to abort the move
     """
 
-    # ── Step 1: Observe — PnP from current position, move to intermediate ────
+    _t_press_start = time.perf_counter()
+
+    # ── Detect at KB_HOME, move directly to hover ─────────────────────────────
+    _t0 = time.perf_counter()
     frame = get_frame()
+    print(f"  [TIMING] get_frame: {(time.perf_counter()-_t0)*1000:.0f}ms", flush=True)
     if frame is None:
         raise RuntimeError("Camera read failed.")
 
-    key_pos_obs = _pnp_key_position(frame, target_key, robot, kin, "observe")
-
-    obs_target = np.array([
-        key_pos_obs[0] + KEY_X_CORRECTION_M,
-        key_pos_obs[1] + KEY_Y_CORRECTION_M,
-        key_pos_obs[2] + INTERMEDIATE_OFFSET_M,
-    ])
-    obs_target = np.clip(obs_target, WS_MIN, WS_MAX)
-
-    result = _move(robot, kin, obs_target, cancel_event=cancel_event)
-    if result == "cancelled":
-        return
-
-    # ── Step 2: Hover — re-detect from top-down view, move to hover height ───
-    time.sleep(0.10)
-
-    frame = get_frame()
-    if frame is None:
-        raise RuntimeError("Camera read failed (hover step).")
-
-    key_pos_fine = _pnp_key_position(
-        frame, target_key, robot, kin, "hover", conf=FINE_CONF_THRESHOLD
-    )
+    key_pos = _pnp_key_position(frame, target_key, robot, kin, "detect")
 
     hover_target = np.array([
-        key_pos_fine[0] + KEY_X_CORRECTION_M,
-        key_pos_fine[1] + KEY_Y_CORRECTION_M,
-        key_pos_fine[2] + HOVER_OFFSET_M,
+        key_pos[0] + KEY_X_CORRECTION_M,
+        key_pos[1] + KEY_Y_CORRECTION_M,
+        key_pos[2] + HOVER_OFFSET_M,
     ])
     hover_target = np.clip(hover_target, WS_MIN, WS_MAX)
 
+    _t0 = time.perf_counter()
     result = _move(robot, kin, hover_target, cancel_event=cancel_event)
+    print(f"  [TIMING] smooth_move (→hover): {time.perf_counter()-_t0:.2f}s", flush=True)
     if result == "cancelled":
         return
 
-    # ── Step 3: Press — stall-detecting Z-only descent ───────────────────────
-    time.sleep(0.02)
+    # ── Re-detect from hover for finer accuracy (no correction move needed) ─────
+    _t0 = time.perf_counter()
+    frame = get_frame()
+    print(f"  [TIMING] get_frame (hover): {(time.perf_counter()-_t0)*1000:.0f}ms", flush=True)
+    if frame is not None:
+        try:
+            key_pos_fine = _pnp_key_position(
+                frame, target_key, robot, kin, "hover", conf=FINE_CONF_THRESHOLD
+            )
+            key_pos = key_pos_fine  # use finer estimate; fallback to coarse if exception
+        except (ValueError, RuntimeError):
+            print(f"  [TIMING] hover re-detect failed, using coarse position", flush=True)
 
+    # ── Press — stall-detecting Z descent ─────────────────────────────────────
     press_target = np.array([
-        key_pos_fine[0] + KEY_X_CORRECTION_M,
-        key_pos_fine[1] + KEY_Y_CORRECTION_M,
-        key_pos_fine[2] - PRESS_BELOW_M,
+        key_pos[0] + KEY_X_CORRECTION_M,
+        key_pos[1] + KEY_Y_CORRECTION_M,
+        key_pos[2] - PRESS_BELOW_M,
     ])
     press_target = np.clip(press_target, WS_MIN, WS_MAX)
 
+    _t0 = time.perf_counter()
     result = _press_down(robot, kin, press_target, cancel_event)
+    print(f"  [TIMING] press_down ({result}): {time.perf_counter()-_t0:.2f}s", flush=True)
+    print(f"  [TIMING] press_key '{target_key}' TOTAL (excl. return): {time.perf_counter()-_t_press_start:.2f}s", flush=True)
     if result == "cancelled":
         return
 
-    # ── Return to KB_HOME (reverse path) ─────────────────────────────────────
+    # ── Return to KB_HOME via joint space (no intermediate Cartesian stop) ────
     if lift:
-        result = _move(robot, kin, hover_target, cancel_event=cancel_event)
-        if result == "cancelled":
-            return
-
-        result = _move(robot, kin, obs_target, cancel_event=cancel_event)
-        if result == "cancelled":
-            return
-
-        kb_home = get_keyboard_home_position(KB_HOME_HEIGHT_M)
-        if kb_home is not None:
-            lift_target = np.clip(kb_home, WS_MIN, WS_MAX)
-            result = _move(robot, kin, lift_target, cancel_event=cancel_event)
-            if result == "cancelled":
-                return
-            if _kb_home_q_deg is not None:
-                _move_to_joints(robot, _kb_home_q_deg, duration=1.0)
-            else:
-                _tilt_to_look_down(robot)
+        if _kb_home_q_deg is not None:
+            _move_to_joints(robot, _kb_home_q_deg, duration=0.8)
+        else:
+            kb_home = get_keyboard_home_position(KB_HOME_HEIGHT_M)
+            if kb_home is not None:
+                _move(robot, kin, np.clip(kb_home, WS_MIN, WS_MAX), cancel_event=cancel_event)
+            _tilt_to_look_down(robot)
 
 
 # ─── Entry point ──────────────────────────────────────────────────────────────

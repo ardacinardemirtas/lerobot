@@ -49,10 +49,10 @@ MAX_MOVE_M = 0.30
 
 # Controller gains (mirror of ControllerConfig defaults in move_to_position_new.py)
 POSITION_GAIN          = 4.0
-MAX_EE_SPEED_M_S       = 0.120
-TERMINAL_EE_SPEED_M_S  = 0.025
-MIN_DURATION_S         = 0.30
-MAX_SETTLE_S           = 3.0
+MAX_EE_SPEED_M_S       = 0.200
+TERMINAL_EE_SPEED_M_S  = 0.040
+MIN_DURATION_S         = 0.20
+MAX_SETTLE_S           = 1.0
 SETTLE_THRESHOLD_M     = 0.0020
 STABLE_TICKS           = 5
 SINGULAR_THRESHOLD     = 0.035
@@ -63,9 +63,9 @@ QP_TASK_WEIGHT         = 50.0
 QP_DAMPING_WEIGHT      = 0.002
 QP_ACCEL_WEIGHT        = 0.006
 QP_POSTURE_WEIGHT      = 0.012
-MAX_JOINT_SPEED_DEG_S  = 75.0
-MAX_JOINT_ACCEL_DEG_S2 = 520.0
-STOP_JOINT_SPEED_DEG_S = 1.0
+MAX_JOINT_SPEED_DEG_S  = 110.0
+MAX_JOINT_ACCEL_DEG_S2 = 700.0
+STOP_JOINT_SPEED_DEG_S = 5.0
 COMMAND_DEADBAND_DEG   = 0.015
 # ─────────────────────────────────────────────────────────────────────────────
 

@@ -1,31 +1,38 @@
 #!/usr/bin/env python3
 """
-eval_keyboard_eval2.py — Eval 2: press any a-z / space key within 10 s.
+eval_keyboard_eval2.py — Eval 2: press a given a-z / space key within 10 s.
 16 rollouts × 3.125 pts = 50 pts max.
 
-The 10-second window for rollout N starts the moment rollout N-1's key is
-physically pressed (stall contact), so the return-to-KB_HOME travel time
-counts against the next rollout's budget.
+The evaluator provides the character(s) — we do NOT use a fixed sequence.
 
 Usage
 -----
-    python eval_keyboard_eval2.py          # headless (default)
-    python eval_keyboard_eval2.py --gui    # with OpenCV window
+    # Interactive (default): evaluator types one key per rollout via stdin
+    python eval_keyboard_eval2.py
 
-Controls (GUI mode)
--------------------
-    Esc     Quit early
-    ,       Return to reset home
-    .       Re-find keyboard home
-    `       Toggle PnP overlay
+    # Single key (evaluator calls once per rollout):
+    python eval_keyboard_eval2.py --key a
+
+    # Batch sequence (evaluator provides all keys upfront):
+    python eval_keyboard_eval2.py --sequence "axihexdsnbcgh"
+
+    # GUI overlay:
+    python eval_keyboard_eval2.py --gui
+    python eval_keyboard_eval2.py --sequence "abc" --gui
+
+Timing
+------
+    Interactive: 10 s window starts when the key is received from stdin.
+    Batch/single: 10 s window starts when arm receives the character input;
+                  return-to-KB_HOME counts against the NEXT window (same as
+                  the physical evaluation cadence).
 """
 
 import argparse
 import os
-import random
 import threading
-import warnings
 import time
+import warnings
 from pathlib import Path
 from typing import Optional
 
@@ -52,8 +59,6 @@ from click_to_move import (  # noqa: E402
     HOME_DEG,
     CAMERA_K,
     DIST_COEFFS,
-    WS_MIN,
-    WS_MAX,
 )
 from move_to_position_qp_hold_orient import (  # noqa: E402
     SO101Kinematics,
@@ -75,38 +80,214 @@ from keyboard_pnp import (  # noqa: E402
 )
 from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
 
-# ── Task definition ───────────────────────────────────────────────────────────
-
-_SENTENCE_SEED   = 42
-_ROLLOUT_COUNT   = 16
-_ROLLOUT_TIME_S  = 10.0
+# ── Constants ─────────────────────────────────────────────────────────────────
+_ROLLOUT_TIME_S     = 10.0
 _POINTS_PER_ROLLOUT = 3.125
-
 _QWERTY_TO_QWERTZ: dict[str, str] = {"y": "z", "z": "y"}
-
 _WIN      = "SO-101  Eval 2  [a-z]"
 _KEY_HOME = 2359296
 _KEY_F5   = 7667712
 
 
-def _generate_sequence(n: int = _ROLLOUT_COUNT, seed: int = _SENTENCE_SEED) -> list[str]:
-    rng = random.Random(seed)
-    seq: list[str] = []
-    while len(seq) < n:
-        word_len = rng.randint(3, 6)
-        for _ in range(word_len):
-            seq.append(rng.choice(list("abcdefghijklmnopqrstuvwxyz")))
-            if len(seq) == n:
-                break
-        if len(seq) < n:
-            seq.append("space")
-    return seq[:n]
+def _parse_key_input(raw: str) -> Optional[str]:
+    """Normalise evaluator input → key label for press_key(), or None."""
+    s = raw.strip().lower()
+    if s in ("space", " ", "spc"):
+        return "space"
+    if s in ("enter", "return"):
+        return "enter"
+    if len(s) == 1 and s.isalpha():
+        return s
+    return None
 
 
-TASK_SEQUENCE = _generate_sequence()
+# ── Frame / camera helpers ────────────────────────────────────────────────────
+
+class _FrameStore:
+    """Thread-safe latest-frame store, filled by a background reader."""
+
+    def __init__(self) -> None:
+        self._lock  = threading.Lock()
+        self._frame: Optional[np.ndarray] = None
+        self._ts    = 0.0
+        self._stop  = threading.Event()
+
+    def start(self, cap: cv2.VideoCapture) -> None:
+        def _reader() -> None:
+            while not self._stop.is_set():
+                ret, frame = cap.read()
+                if ret:
+                    ts = time.monotonic()
+                    with self._lock:
+                        self._frame = frame.copy()
+                        self._ts    = ts
+        threading.Thread(target=_reader, daemon=True).start()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def get(self, fresh: bool = False) -> Optional[np.ndarray]:
+        if not fresh:
+            with self._lock:
+                return self._frame.copy() if self._frame is not None else None
+        deadline = time.monotonic()
+        while True:
+            with self._lock:
+                if self._ts > deadline and self._frame is not None:
+                    return self._frame.copy()
+            time.sleep(0.005)
 
 
-# ── Detection worker (GUI mode only) ──────────────────────────────────────────
+# ── Core press logic ──────────────────────────────────────────────────────────
+
+def do_press(
+    key_label: str,
+    robot: SO101Follower,
+    kin: SO101Kinematics,
+    store: _FrameStore,
+    deadline: float,
+    cancel: threading.Event,
+) -> tuple[bool, float]:
+    """Press key_label; return (success, elapsed_s from window open)."""
+    window_open = deadline - _ROLLOUT_TIME_S
+    robot_label = _QWERTY_TO_QWERTZ.get(key_label, key_label)
+    try:
+        press_key(robot_label, robot, kin,
+                  lambda: store.get(fresh=True),
+                  lift=False, cancel_event=cancel)
+        t = time.monotonic()
+        success = not cancel.is_set() and t <= deadline
+    except Exception as exc:
+        t = time.monotonic()
+        success = False
+        print(f"  [error] {exc}", flush=True)
+    elapsed = t - window_open
+    return success, elapsed
+
+
+# ── Headless runners ──────────────────────────────────────────────────────────
+
+def _setup_kb_home(robot, kin, store):
+    print("Finding keyboard home …", flush=True)
+    find_kb_home(robot, kin, lambda: store.get(fresh=True))
+    print("KB_HOME set.\n", flush=True)
+
+
+def run_interactive(
+    robot: SO101Follower,
+    kin: SO101Kinematics,
+    store: _FrameStore,
+    n_rollouts: int,
+) -> None:
+    _setup_kb_home(robot, kin, store)
+
+    results: list[dict] = []
+    score = 0.0
+    cancel = threading.Event()
+
+    for idx in range(n_rollouts):
+        # Arm is at KB_HOME — signal ready and wait for evaluator input
+        print(f"[{idx+1:2d}/{n_rollouts}] READY — enter key: ", end="", flush=True)
+        try:
+            raw = input()
+        except EOFError:
+            break
+
+        key = _parse_key_input(raw)
+        if key is None:
+            print(f"  [skip] unrecognised input '{raw}'", flush=True)
+            continue
+
+        # 10 s window starts NOW (when key is received)
+        deadline = time.monotonic() + _ROLLOUT_TIME_S
+        print(f"  pressing '{key}' …", flush=True)
+        cancel.clear()
+
+        success, elapsed = do_press(key, robot, kin, store, deadline, cancel)
+
+        if success:
+            score += _POINTS_PER_ROLLOUT
+        icon = "✓" if success else "✗"
+        print(f"  {icon} {elapsed:.2f}s | score={score:.1f}", flush=True)
+        results.append({"rollout": idx + 1, "key": key,
+                        "success": success, "elapsed_s": round(elapsed, 2)})
+
+        if idx < n_rollouts - 1:
+            return_to_kb_home(robot)
+
+    _print_summary(results, score)
+
+
+def run_single_key(
+    robot: SO101Follower,
+    kin: SO101Kinematics,
+    store: _FrameStore,
+    key: str,
+) -> None:
+    _setup_kb_home(robot, kin, store)
+    cancel   = threading.Event()
+    deadline = time.monotonic() + _ROLLOUT_TIME_S
+    print(f"Pressing '{key}' …", flush=True)
+    success, elapsed = do_press(key, robot, kin, store, deadline, cancel)
+    icon = "✓" if success else "✗"
+    print(f"{icon} {elapsed:.2f}s", flush=True)
+
+
+def run_sequence(
+    robot: SO101Follower,
+    kin: SO101Kinematics,
+    store: _FrameStore,
+    sequence: list[str],
+) -> None:
+    _setup_kb_home(robot, kin, store)
+
+    results: list[dict] = []
+    score    = 0.0
+    cancel   = threading.Event()
+    # First window opens now
+    deadline = time.monotonic() + _ROLLOUT_TIME_S
+
+    for idx, key in enumerate(sequence):
+        window_open = deadline - _ROLLOUT_TIME_S
+        time_left   = max(0.0, deadline - time.monotonic())
+        print(f"[{idx+1:2d}/{len(sequence)}] '{key}'  budget={time_left:.1f}s  pressing …",
+              flush=True)
+        cancel.clear()
+
+        success, elapsed = do_press(key, robot, kin, store, deadline, cancel)
+
+        press_time = time.monotonic()   # deadline for NEXT key starts here
+        if success:
+            score += _POINTS_PER_ROLLOUT
+        icon = "✓" if success else "✗"
+        print(f"  {icon} {elapsed:.2f}s | score={score:.1f}", flush=True)
+        results.append({"rollout": idx + 1, "key": key,
+                        "success": success, "elapsed_s": round(elapsed, 2)})
+
+        if cancel.is_set():
+            break
+
+        next_deadline = press_time + _ROLLOUT_TIME_S
+        if idx < len(sequence) - 1:
+            return_to_kb_home(robot)
+        deadline = next_deadline
+
+    _print_summary(results, score)
+
+
+def _print_summary(results: list[dict], score: float) -> None:
+    total = len(results) * _POINTS_PER_ROLLOUT
+    n_ok  = sum(1 for r in results if r["success"])
+    print(f"\n{'─'*45}")
+    print(f"  Eval 2 — score: {score:.2f} / {total:.2f}  ({n_ok}/{len(results)} correct)")
+    print(f"{'─'*45}")
+    for r in results:
+        icon = "✓" if r["success"] else "✗"
+        print(f"  {r['rollout']:2d}. {icon}  '{r['key']}'  {r['elapsed_s']:.2f}s")
+    print(f"{'─'*45}\n")
+
+
+# ── GUI mode (optional) ───────────────────────────────────────────────────────
 
 class _DetectionWorker(threading.Thread):
     def __init__(self) -> None:
@@ -117,7 +298,7 @@ class _DetectionWorker(threading.Thread):
         self._det_fps   = 0.0
         self._det_err   = ""
         self._new_frame = threading.Event()
-        self._stop      = threading.Event()
+        self._stop_evt  = threading.Event()
 
     def post_frame(self, frame: np.ndarray) -> None:
         with self._lock:
@@ -129,11 +310,11 @@ class _DetectionWorker(threading.Thread):
             return list(self._preds), self._det_fps, self._det_err
 
     def stop(self) -> None:
-        self._stop.set()
+        self._stop_evt.set()
         self._new_frame.set()
 
     def run(self) -> None:
-        while not self._stop.is_set():
+        while not self._stop_evt.is_set():
             if not self._new_frame.wait(timeout=0.1):
                 continue
             self._new_frame.clear()
@@ -147,380 +328,189 @@ class _DetectionWorker(threading.Thread):
                 preds = detect_keys(frame)
                 fps   = 1.0 / max(time.perf_counter() - t0, 1e-3)
                 with self._lock:
-                    self._preds   = preds
-                    self._det_fps = fps
-                    self._det_err = ""
+                    self._preds, self._det_fps, self._det_err = preds, fps, ""
             except Exception as exc:
                 with self._lock:
                     self._det_err = str(exc)[:80]
 
 
-# ── Core eval (shared between headless and GUI) ───────────────────────────────
+def run_gui(
+    robot: SO101Follower,
+    kin: SO101Kinematics,
+    cap: cv2.VideoCapture,
+    home_pos: np.ndarray,
+    sequence: Optional[list[str]],
+    n_rollouts: int,
+) -> None:
+    """GUI wrapper: shows camera + detection overlay while running the sequence."""
+    frame_lock   = threading.Lock()
+    latest_frame: list[Optional[np.ndarray]] = [None]
+    frame_ts:     list[float] = [0.0]
 
-class Eval2:
-
-    def __init__(
-        self,
-        robot: SO101Follower,
-        kin: SO101Kinematics,
-        cap: cv2.VideoCapture,
-        home_pos: np.ndarray,
-        gui: bool = False,
-    ) -> None:
-        self.robot  = robot
-        self.kin    = kin
-        self.cap    = cap
-        self._home  = home_pos.copy()
-        self._gui   = gui
-
-        self._frame_lock   = threading.Lock()
-        self._latest_frame: Optional[np.ndarray] = None
-        self._frame_ts     = 0.0
-
-        self._cancel_evt   = threading.Event()
-        self._press_lock   = threading.Lock()
-        self._press_thread: Optional[threading.Thread] = None
-        self._active_key:  Optional[str] = None
-
-        # Rollout state (also read by GUI draw)
-        self._rollout_idx         = 0
-        self._score               = 0.0
-        self._rollout_active      = False
-        self._all_done            = False
-        self._rollout_window_start = 0.0   # when this rollout's 10s window opened
-        self._results: list[dict] = []
-
-        self._status   = "Finding keyboard home …"
-        self._show_pnp = True
-
-        self._stop_reader = threading.Event()
-        self._det: Optional[_DetectionWorker] = None
-
-    # ── Frame provider ────────────────────────────────────────────────────────
-
-    def _get_frame(self, fresh: bool = False) -> Optional[np.ndarray]:
+    def _get_frame(fresh: bool = False) -> Optional[np.ndarray]:
         if not fresh:
-            with self._frame_lock:
-                return self._latest_frame.copy() if self._latest_frame is not None else None
+            with frame_lock:
+                return latest_frame[0].copy() if latest_frame[0] is not None else None
         deadline = time.monotonic()
         while True:
-            with self._frame_lock:
-                if self._frame_ts > deadline and self._latest_frame is not None:
-                    return self._latest_frame.copy()
+            with frame_lock:
+                if frame_ts[0] > deadline and latest_frame[0] is not None:
+                    return latest_frame[0].copy()
             time.sleep(0.005)
 
-    def _start_frame_reader(self) -> None:
-        """Headless: pump the camera in a background thread."""
-        def _reader() -> None:
-            while not self._stop_reader.is_set():
-                ret, frame = self.cap.read()
-                if ret:
-                    ts = time.monotonic()
-                    with self._frame_lock:
-                        self._latest_frame = frame.copy()
-                        self._frame_ts     = ts
-        t = threading.Thread(target=_reader, daemon=True)
-        t.start()
+    # Shared GUI state
+    state = {
+        "status": "Finding keyboard home …",
+        "active_key": None,
+        "rollout_idx": 0,
+        "score": 0.0,
+        "deadline": 0.0,
+        "window_open": 0.0,
+        "results": [],
+        "show_pnp": True,
+        "done": False,
+    }
 
-    # ── Rollout loop ──────────────────────────────────────────────────────────
+    det = _DetectionWorker()
+    det.start()
 
-    def _run_all_rollouts(self) -> None:
-        # First rollout gets a full 10 s window from now.
-        deadline = time.monotonic() + _ROLLOUT_TIME_S
+    cancel  = threading.Event()
+    press_thread: list[Optional[threading.Thread]] = [None]
 
-        for idx in range(self._rollout_idx, _ROLLOUT_COUNT):
-            if self._cancel_evt.is_set():
-                break
-
-            key_label   = TASK_SEQUENCE[idx]
-            robot_label = _QWERTY_TO_QWERTZ.get(key_label, key_label)
-
-            self._rollout_idx          = idx
-            self._rollout_active       = True
-            # Window start is 10 s before the deadline — used by GUI timer.
-            self._rollout_window_start = deadline - _ROLLOUT_TIME_S
-
-            time_left = max(0.0, deadline - time.monotonic())
-            print(f"[{idx+1:2d}/{_ROLLOUT_COUNT}]  '{key_label}'  "
-                  f"budget={time_left:.1f}s  pressing …", flush=True)
-
-            with self._press_lock:
-                self._active_key = robot_label
-
-            success    = False
-            press_time = None
-            try:
-                press_key(
-                    robot_label,
-                    self.robot,
-                    self.kin,
-                    lambda: self._get_frame(fresh=True),
-                    lift=False,
-                    cancel_event=self._cancel_evt,
-                )
-                press_time = time.monotonic()
-                if not self._cancel_evt.is_set() and press_time <= deadline:
-                    success = True
-            except Exception as exc:
-                press_time = time.monotonic()
-                print(f"         error: {exc}", flush=True)
-
-            with self._press_lock:
-                self._active_key = None
-
-            if press_time is None:
-                press_time = time.monotonic()
-
-            elapsed = press_time - self._rollout_window_start
-            if success:
-                self._score += _POINTS_PER_ROLLOUT
-
-            self._results.append({
-                "rollout":      idx + 1,
-                "key":          key_label,
-                "success":      success,
-                "elapsed_s":    round(elapsed, 2),
-                "score_so_far": self._score,
-            })
-            self._rollout_active = False
-
-            icon = "✓" if success else "✗"
-            print(f"         {icon}  {elapsed:.2f}s  score={self._score:.1f}", flush=True)
-
-            if self._cancel_evt.is_set():
-                break
-
-            # ── Timer for NEXT rollout starts from this press_time ────────────
-            next_deadline = press_time + _ROLLOUT_TIME_S
-
-            if idx < _ROLLOUT_COUNT - 1:
-                return_to_kb_home(self.robot)
-
-            deadline = next_deadline
-
-        self._all_done    = True
-        self._rollout_idx = _ROLLOUT_COUNT
-        self._print_summary()
-        self._status = (
-            f"Done!  Score: {self._score:.1f} / "
-            f"{_ROLLOUT_COUNT * _POINTS_PER_ROLLOUT:.1f}"
-        )
-
-    def _print_summary(self) -> None:
-        total = _ROLLOUT_COUNT * _POINTS_PER_ROLLOUT
-        n_ok  = sum(1 for r in self._results if r["success"])
-        print(f"\n{'─'*45}")
-        print(f"  Eval 2 — final score: {self._score:.2f} / {total:.2f}")
-        print(f"  Correct: {n_ok}/{len(self._results)}")
-        print(f"{'─'*45}")
-        for r in self._results:
-            icon = "✓" if r["success"] else "✗"
-            print(f"  {r['rollout']:2d}. {icon}  '{r['key']}'  {r['elapsed_s']:.2f}s")
-        print(f"{'─'*45}\n")
-
-    # ── Headless run ──────────────────────────────────────────────────────────
-
-    def run_headless(self) -> None:
-        self._start_frame_reader()
+    def _worker():
         try:
-            print("Finding keyboard home …", flush=True)
-            find_kb_home(self.robot, self.kin,
-                         lambda: self._get_frame(fresh=True))
-            print("KB_HOME set — starting rollouts.\n", flush=True)
-            self._run_all_rollouts()
-        except KeyboardInterrupt:
-            print("\nInterrupted.", flush=True)
-        finally:
-            self._stop_reader.set()
+            state["status"] = "Finding keyboard home …"
+            find_kb_home(robot, kin, lambda: _get_frame(fresh=True))
+            state["status"] = "KB_HOME set"
 
-    # ── GUI draw ──────────────────────────────────────────────────────────────
+            keys = sequence if sequence else []
+            score = 0.0
 
-    def _draw(self, frame: np.ndarray) -> np.ndarray:
-        assert self._det is not None
-        preds, det_fps, det_err = self._det.get_state()
+            if sequence:
+                deadline = time.monotonic() + _ROLLOUT_TIME_S
+                for idx, key in enumerate(keys):
+                    state["rollout_idx"] = idx
+                    state["deadline"]    = deadline
+                    state["window_open"] = deadline - _ROLLOUT_TIME_S
+                    state["active_key"]  = key
+                    state["status"] = f"[{idx+1}/{len(keys)}] pressing '{key}' …"
+                    cancel.clear()
 
-        with self._press_lock:
-            moving     = self._press_thread is not None and self._press_thread.is_alive()
-            active_key = self._active_key
+                    success, elapsed = do_press(
+                        key, robot, kin,
+                        type("S", (), {"get": staticmethod(_get_frame)})(),
+                        deadline, cancel,
+                    )
+                    press_time = time.monotonic()
+                    if success:
+                        score += _POINTS_PER_ROLLOUT
+                    state["score"] = score
+                    state["active_key"] = None
+                    icon = "✓" if success else "✗"
+                    state["status"] = f"{icon} '{key}' {elapsed:.1f}s | score={score:.1f}"
+                    state["results"].append({"key": key, "success": success})
+                    if cancel.is_set():
+                        break
+                    next_deadline = press_time + _ROLLOUT_TIME_S
+                    if idx < len(keys) - 1:
+                        return_to_kb_home(robot)
+                    deadline = next_deadline
+            else:
+                # Interactive: can't do GUI + blocking input simultaneously
+                # Fall back to sequence display hint
+                state["status"] = "Run without --gui for interactive mode. Use --sequence."
 
+            state["done"] = True
+            state["status"] = f"Done! Score={score:.1f}/{len(keys)*_POINTS_PER_ROLLOUT:.1f}"
+            _print_summary(state["results_full"] if "results_full" in state else [], score)
+        except Exception as exc:
+            state["status"] = f"Error: {exc}"
+            state["done"] = True
+
+    t = threading.Thread(target=_worker, daemon=True)
+    press_thread[0] = t
+    t.start()
+
+    cv2.namedWindow(_WIN, cv2.WINDOW_NORMAL)
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            frame = np.zeros((CAMERA_HEIGHT, CAMERA_WIDTH, 3), dtype=np.uint8)
+        ts = time.monotonic()
+        with frame_lock:
+            latest_frame[0] = frame.copy()
+            frame_ts[0]     = ts
+
+        det.post_frame(frame)
+
+        # Draw
+        preds, det_fps, det_err = det.get_state()
         h, w = frame.shape[:2]
-
-        if self._show_pnp and preds:
+        if state["show_pnp"] and preds:
             dets = detections_from_roboflow(preds)
             if dets:
                 draw_pnp_overlay(frame, dets, CAMERA_K, DIST_COEFFS)
-
         for p in preds:
-            lbl  = p["class"]
-            conf = float(p["confidence"])
-            px   = float(p["x"]);  py = float(p["y"])
-            bw   = float(p["width"]); bh = float(p["height"])
-            x1 = int(px - bw / 2);  x2 = int(px + bw / 2)
-            y1 = int(py - bh / 2);  y2 = int(py + bh / 2)
+            lbl = p["class"]
+            px, py = float(p["x"]), float(p["y"])
+            bw, bh = float(p["width"]), float(p["height"])
+            x1, x2 = int(px - bw/2), int(px + bw/2)
+            y1, y2 = int(py - bh/2), int(py + bh/2)
+            color = (255, 80, 0) if lbl == state["active_key"] else (50, 220, 50)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 1, cv2.LINE_AA)
 
-            if lbl.lower() == "keyboard":
-                color, thick = (0, 165, 255), 2
-            elif lbl == active_key:
-                color, thick = (255, 80, 0), 2
-            else:
-                color, thick = (50, 220, 50), 1
-
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, thick, cv2.LINE_AA)
-            if lbl.lower() != "keyboard":
-                cv2.circle(frame, (int(px), int(py)), 3, color, -1, cv2.LINE_AA)
-                txt = f"{lbl} {conf:.0%}"
-                (tw, th), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.38, 1)
-                tx = max(0, min(x1, w - tw - 4))
-                ty = max(th + 6, y1 - 3)
-                cv2.rectangle(frame, (tx - 2, ty - th - 3), (tx + tw + 2, ty + 3), color, -1)
-                cv2.putText(frame, txt, (tx, ty),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 0, 0), 1, cv2.LINE_AA)
-
-        # ── Current key + timer ───────────────────────────────────────────────
-        if self._rollout_active and active_key is not None:
-            elapsed   = time.monotonic() - self._rollout_window_start
-            remaining = max(0.0, _ROLLOUT_TIME_S - elapsed)
-            cv2.putText(frame, f"PRESS: {active_key.upper()}", (8, 40),
+        # Active key + timer
+        ak = state["active_key"]
+        if ak:
+            remaining = max(0.0, state["deadline"] - time.monotonic())
+            cv2.putText(frame, f"PRESS: {ak.upper()}", (8, 40),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 230, 255), 2, cv2.LINE_AA)
-            t_color = (0, 60, 255) if remaining < 3.0 else (200, 255, 200)
-            (tw, _), _ = cv2.getTextSize(f"{remaining:.1f}s", cv2.FONT_HERSHEY_SIMPLEX, 0.9, 2)
+            tc = (0, 60, 255) if remaining < 3 else (200, 255, 200)
+            (tw, _), _ = cv2.getTextSize(f"{remaining:.1f}s",
+                                          cv2.FONT_HERSHEY_SIMPLEX, 0.9, 2)
             cv2.putText(frame, f"{remaining:.1f}s", (w - tw - 10, 40),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, t_color, 2, cv2.LINE_AA)
-        else:
-            cv2.putText(frame, self._status, (8, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1, cv2.LINE_AA)
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, tc, 2, cv2.LINE_AA)
 
-        # ── Score + progress ──────────────────────────────────────────────────
-        cv2.putText(
-            frame,
-            f"Rollout {min(self._rollout_idx+1, _ROLLOUT_COUNT)}/{_ROLLOUT_COUNT}"
-            f"   Score: {self._score:.1f} / {_ROLLOUT_COUNT*_POINTS_PER_ROLLOUT:.1f}",
-            (8, 62), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (255, 220, 80), 1, cv2.LINE_AA,
-        )
+        cv2.putText(frame,
+                    f"Score: {state['score']:.1f}  Rollout: {state['rollout_idx']+1}",
+                    (8, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (255, 220, 80), 1, cv2.LINE_AA)
 
-        # Sequence preview
-        preview = TASK_SEQUENCE[self._rollout_idx:self._rollout_idx + 8]
-        prev_str = "  ".join(
-            f"[{k.upper()}]" if i == 0 and self._rollout_active else k.upper()
-            for i, k in enumerate(preview)
-        )
-        cv2.putText(frame, prev_str, (8, 82),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.40, (180, 180, 255), 1, cv2.LINE_AA)
-
-        # Result dots
-        for i, r in enumerate(self._results):
-            color = (60, 220, 60) if r["success"] else (60, 60, 220)
-            cv2.circle(frame, (8 + i * 18, 100), 6, color, -1, cv2.LINE_AA)
-
-        # Det stats
-        n_keys   = sum(1 for p in preds if p["class"].lower() != "keyboard")
-        pnp_flag = "PnP ON" if self._show_pnp else "PnP off"
-        stat_txt = (f"DET ERR: {det_err[:50]}" if det_err
-                    else f"det {det_fps:.1f} Hz  |  {n_keys} key(s)  |  {pnp_flag}")
-        cv2.putText(frame, stat_txt, (8, 118),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.34, (160, 160, 160), 1, cv2.LINE_AA)
-
-        # Status bar
-        bar_h = 46
+        bar_h = 40
         frame[h - bar_h:] = (frame[h - bar_h:] * 0.35).astype(np.uint8)
-        cv2.putText(frame, self._status, (8, h - bar_h + 16),
+        cv2.putText(frame, state["status"], (8, h - bar_h + 18),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.44, (255, 255, 255), 1, cv2.LINE_AA)
-        cv2.putText(frame, ",=home  .=KB_home  `=overlay  Esc=quit",
-                    (8, h - bar_h + 36),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.30, (160, 220, 160), 1, cv2.LINE_AA)
 
-        return frame
-
-    # ── GUI run ───────────────────────────────────────────────────────────────
-
-    def _gui_cancel(self) -> None:
-        self._cancel_evt.set()
-        with self._press_lock:
-            t = self._press_thread
-        if t is not None and t.is_alive():
-            t.join(timeout=2.0)
-        self._cancel_evt.clear()
-
-    def _gui_go_home(self) -> None:
-        self._gui_cancel()
-        self._rollout_active = False
-        def _worker():
-            self._status = "Returning to reset home …"
-            smooth_move(self.robot, self.kin, self._home)
-            self._status = "At reset home"
-        t = threading.Thread(target=_worker, daemon=True)
-        with self._press_lock:
-            self._press_thread = t
-        t.start()
-
-    def _gui_go_kb_home(self, then_start: bool = False) -> None:
-        self._gui_cancel()
-        self._rollout_active = False
-        def _worker():
-            self._status = "Finding keyboard home …"
-            try:
-                find_kb_home(self.robot, self.kin,
-                             lambda: self._get_frame(fresh=True))
-                self._status = "KB_HOME set"
-            except Exception as exc:
-                self._status = f"KB_HOME failed: {exc}"
-                return
-            if then_start:
-                self._run_all_rollouts()
-        t = threading.Thread(target=_worker, daemon=True)
-        with self._press_lock:
-            self._press_thread = t
-        t.start()
-
-    def run_gui(self) -> None:
-        self._det = _DetectionWorker()
-        self._det.start()
-        cv2.namedWindow(_WIN, cv2.WINDOW_NORMAL)
-
-        self._gui_go_kb_home(then_start=True)
-
-        while True:
-            ret, frame = self.cap.read()
-            if not ret:
-                frame = np.zeros((CAMERA_HEIGHT, CAMERA_WIDTH, 3), dtype=np.uint8)
-                cv2.putText(frame, "No camera signal", (60, CAMERA_HEIGHT // 2),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (40, 40, 200), 2)
-
-            ts = time.monotonic()
-            with self._frame_lock:
-                self._latest_frame = frame.copy()
-                self._frame_ts     = ts
-
-            self._det.post_frame(frame)
-            cv2.imshow(_WIN, self._draw(frame.copy()))
-
-            key = cv2.waitKeyEx(1)
-            if key == -1:
-                continue
+        cv2.imshow(_WIN, frame)
+        key = cv2.waitKeyEx(1)
+        if key != -1:
             ch = key & 0xFF
-
             if ch == 27:
+                cancel.set()
                 break
-            elif ch == ord(","):
-                self._gui_go_home()
-            elif ch == ord(".") or key == _KEY_F5:
-                self._gui_go_kb_home(then_start=False)
-            elif key == _KEY_HOME:
-                self._gui_go_home()
             elif ch == 96:
-                self._show_pnp = not self._show_pnp
+                state["show_pnp"] = not state["show_pnp"]
 
-        self._gui_cancel()
-        self._det.stop()
-        cv2.destroyAllWindows()
+    cancel.set()
+    det.stop()
+    cv2.destroyAllWindows()
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def _parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Eval 2 — a-z key press (16 rollouts)")
+    p = argparse.ArgumentParser(
+        description="Eval 2 — press a-z keys on demand (16 rollouts × 3.125 pts)"
+    )
+    group = p.add_mutually_exclusive_group()
+    group.add_argument("--key", metavar="K",
+                       help="Single key to press (a-z or 'space')")
+    group.add_argument("--sequence", metavar="CHARS",
+                       help="All keys as a string, e.g. 'axihexd' or 'a x i h e x d'")
+    p.add_argument("--rollouts", type=int, default=16,
+                   help="Number of rollouts in interactive mode (default 16)")
     p.add_argument("--gui", action="store_true", default=False,
-                   help="Show OpenCV window (default: headless terminal)")
+                   help="Show OpenCV window")
     return p.parse_args()
 
 
@@ -528,17 +518,19 @@ def main() -> None:
     args = _parse_args()
 
     if not ROBOFLOW_API_KEY:
-        raise RuntimeError(
-            "ROBOFLOW_API_KEY not set.\n"
-            f"Add it to  {_ENV_FILE}"
-        )
+        raise RuntimeError(f"ROBOFLOW_API_KEY not set — add it to {_ENV_FILE}")
 
-    seq_display = " ".join(k if k != "space" else "[spc]" for k in TASK_SEQUENCE)
     print(f"{'─'*55}")
-    print(f"  Eval 2  {'(GUI)' if args.gui else '(headless)'}  "
-          f"16 rollouts × {_POINTS_PER_ROLLOUT} pts")
-    print(f"  Sequence (seed={_SENTENCE_SEED}): {seq_display}")
-    print(f"  10 s window starts at the moment each key is pressed")
+    print(f"  Eval 2  {'(GUI)' if args.gui else '(headless)'}  {_ROLLOUT_TIME_S}s per key")
+    if args.key:
+        print(f"  Mode: single key  →  '{args.key}'")
+    elif args.sequence:
+        seq_list = [_parse_key_input(c) or c
+                    for c in (args.sequence.split() if " " in args.sequence
+                              else list(args.sequence))]
+        print(f"  Mode: sequence  →  {seq_list}")
+    else:
+        print(f"  Mode: interactive  ({args.rollouts} rollouts via stdin)")
     print(f"{'─'*55}\n")
 
     with warnings.catch_warnings():
@@ -546,8 +538,7 @@ def main() -> None:
         kin = SO101Kinematics(URDF_PATH)
 
     robot = SO101Follower(SO101FollowerConfig(
-        port=PORT,
-        id=ROBOT_ID,
+        port=PORT, id=ROBOT_ID,
         calibration_dir=CALIBRATION_DIR,
         use_degrees=True,
     ))
@@ -562,12 +553,34 @@ def main() -> None:
 
     home = kin.forward_kinematics(HOME_DEG)[:3, 3].copy()
 
-    app = Eval2(robot, kin, cap, home_pos=home, gui=args.gui)
     try:
         if args.gui:
-            app.run_gui()
+            seq: Optional[list[str]] = None
+            if args.key:
+                seq = [_parse_key_input(args.key) or args.key]
+            elif args.sequence:
+                raw_seq = (args.sequence.split() if " " in args.sequence
+                           else list(args.sequence))
+                seq = [_parse_key_input(c) or c for c in raw_seq]
+            run_gui(robot, kin, cap, home, seq, args.rollouts)
         else:
-            app.run_headless()
+            store = _FrameStore()
+            store.start(cap)
+            try:
+                if args.key:
+                    key = _parse_key_input(args.key)
+                    if key is None:
+                        raise ValueError(f"Invalid key: '{args.key}'")
+                    run_single_key(robot, kin, store, key)
+                elif args.sequence:
+                    raw_seq = (args.sequence.split() if " " in args.sequence
+                               else list(args.sequence))
+                    seq_list = [_parse_key_input(c) or c for c in raw_seq]
+                    run_sequence(robot, kin, store, seq_list)
+                else:
+                    run_interactive(robot, kin, store, args.rollouts)
+            finally:
+                store.stop()
     finally:
         cap.release()
         robot.disconnect()
