@@ -79,7 +79,7 @@ from move_to_position_qp import (  # noqa: E402
     JOINT_INDEX,
 )
 from keyboard_pnp import (  # noqa: E402
-    detections_from_roboflow,
+    detections_from_roboflow_accumulated,
     get_key_positions_in_base_frame,
     locate_key_in_base_frame,
     get_keyboard_home_position,
@@ -112,6 +112,12 @@ HOVER_OFFSET_M = 0.04
 # Lower than CONF_THRESHOLD because we want as many key correspondences as
 # possible for a robust PnP from the top-down view.
 FINE_CONF_THRESHOLD = 0.35
+
+# Multi-frame PnP detection accumulation. The arm stays still while these
+# frames are sampled, then the best per-key centroids are merged before PnP.
+PNP_ACCUM_FRAMES = 5
+PNP_ACCUM_DELAY_S = 0.04
+PNP_ACCUM_MIN_HITS = 1
 
 # How far below the PnP-derived key-top surface to aim for the press.
 # Stall detection stops descent at key contact regardless of this value.
@@ -173,6 +179,49 @@ def _T_base_cam(robot: SO101Follower, kin: SO101Kinematics) -> np.ndarray:
 def _current_pos(robot: SO101Follower, kin: SO101Kinematics) -> np.ndarray:
     obs = robot.get_observation()
     return kin.forward_kinematics(_joints_from_obs(obs))[:3, 3].copy()
+
+
+def _accumulated_pnp_detections(
+    robot: SO101Follower,
+    kin: SO101Kinematics,
+    get_frame,
+    step_label: str,
+    conf: float,
+) -> tuple[np.ndarray, dict[str, tuple[float, float]], int, int]:
+    """
+    Capture a settled arm pose, sample several frames, and merge key detections.
+
+    T_base_cam is captured once before the network calls so the pose used for
+    PnP matches the stationary camera during the burst.
+    """
+    T_bc = _T_base_cam(robot, kin)
+    batches: list[list[dict]] = []
+    frames_used = 0
+    t0 = time.perf_counter()
+
+    for idx in range(PNP_ACCUM_FRAMES):
+        frame = get_frame()
+        if frame is None:
+            print(f"  [{step_label}] Frame {idx + 1}/{PNP_ACCUM_FRAMES}: camera read failed")
+        else:
+            frames_used += 1
+            batches.append(detect_keys(frame, conf))
+        if idx + 1 < PNP_ACCUM_FRAMES:
+            time.sleep(PNP_ACCUM_DELAY_S)
+
+    raw_predictions = sum(len(batch) for batch in batches)
+    dets = detections_from_roboflow_accumulated(
+        batches,
+        min_hits=PNP_ACCUM_MIN_HITS,
+    )
+    elapsed_ms = (time.perf_counter() - t0) * 1000.0
+    keys = ", ".join(sorted(dets)) if dets else "none"
+    print(
+        f"  [{step_label}] Accumulated detection: "
+        f"frames={frames_used}/{PNP_ACCUM_FRAMES}  raw={raw_predictions}  "
+        f"layout_keys={len(dets)} [{keys}]  time={elapsed_ms:.0f} ms"
+    )
+    return T_bc, dets, frames_used, raw_predictions
 
 
 def _move(
@@ -265,35 +314,40 @@ def _press_down(
 
 
 def _pnp_key_position(
-    frame: np.ndarray,
     target_key: str,
     robot: SO101Follower,
     kin: SO101Kinematics,
+    get_frame,
     step_label: str,
-    conf: float = CONF_THRESHOLD,
+    conf: float = FINE_CONF_THRESHOLD,
 ) -> np.ndarray:
     """
-    Run detection + PnP on frame, return key_pos_base (3,) in robot base frame.
+    Run accumulated detection + PnP, return key_pos_base (3,) in robot base frame.
 
-    T_base_cam is read BEFORE the network call so the FK matches the captured
-    frame even if the API call takes several seconds.
+    T_base_cam is read before the network calls so the FK matches the settled
+    camera pose during the accumulation burst.
     Raises ValueError if detection or PnP fails.
     """
-    # Read FK now, while the arm is settled and the frame was just captured.
-    T_bc = _T_base_cam(robot, kin)
-
-    t0    = time.perf_counter()
-    preds = detect_keys(frame, conf)
-    print(f"  [{step_label}] Detection: {len(preds)} objects in "
-          f"{(time.perf_counter()-t0)*1000:.0f} ms")
-
-    dets = detections_from_roboflow(preds)
-    if not dets:
-        raise ValueError(f"[{step_label}] No keys detected.")
-
-    positions, reproj_err = get_key_positions_in_base_frame(
-        dets, T_bc, CAMERA_K, DIST_COEFFS
+    T_bc, dets, frames_used, raw_predictions = _accumulated_pnp_detections(
+        robot, kin, get_frame, step_label, conf
     )
+    if not dets:
+        raise ValueError(
+            f"[{step_label}] No layout keys detected across "
+            f"{frames_used}/{PNP_ACCUM_FRAMES} frames "
+            f"({raw_predictions} raw predictions)."
+        )
+
+    try:
+        positions, reproj_err = get_key_positions_in_base_frame(
+            dets, T_bc, CAMERA_K, DIST_COEFFS
+        )
+    except ValueError as exc:
+        raise ValueError(
+            f"[{step_label}] PnP failed after accumulating "
+            f"{len(dets)} layout keys from {frames_used}/{PNP_ACCUM_FRAMES} "
+            f"frames ({raw_predictions} raw predictions): {exc}"
+        ) from exc
     print(f"  [{step_label}] PnP reproj error: {reproj_err:.2f} px")
 
     if reproj_err > MAX_REPROJ_ACCEPT_PX:
@@ -446,16 +500,15 @@ def find_kb_home(
         print(f"  [KB_HOME] Refinement {iteration + 1}/{n_refine} …")
 
         # ── Detect keyboard ───────────────────────────────────────────────────
-        frame = get_frame()
-        if frame is None:
-            raise RuntimeError("KB_HOME: camera read failed.")
-        T_bc  = _T_base_cam(robot, kin)
-        preds = detect_keys(frame, FINE_CONF_THRESHOLD)
-        dets  = detections_from_roboflow(preds)
+        T_bc, dets, frames_used, raw_predictions = _accumulated_pnp_detections(
+            robot, kin, get_frame, "KB_HOME", FINE_CONF_THRESHOLD
+        )
 
         if not dets:
             raise RuntimeError(
-                "KB_HOME: no keys detected from HOME_DEG. "
+                "KB_HOME: no layout keys detected from HOME_DEG "
+                f"across {frames_used}/{PNP_ACCUM_FRAMES} frames "
+                f"({raw_predictions} raw predictions). "
                 "Adjust HOME_DEG in click_to_move.py until the keyboard is "
                 "visible in the camera from that position."
             )
@@ -543,12 +596,8 @@ def press_key(
 
     # ── Step 1: Observe — PnP from current position, move to intermediate ────
     print(f"\n[Step 1/3 — observe]  Locating '{target_key}' via PnP …")
-    frame = get_frame()
-    if frame is None:
-        raise RuntimeError("Camera read failed.")
-
     key_pos_obs = _pnp_key_position(
-        frame, target_key, robot, kin, "observe"
+        target_key, robot, kin, get_frame, "observe"
     )
 
     # Intermediate: directly above the key but high enough for a top-down view.
@@ -570,12 +619,8 @@ def press_key(
     print(f"\n[Step 2/3 — hover]    Re-detecting '{target_key}' from top-down view …")
     time.sleep(0.10)   # let arm vibration damp out
 
-    frame = get_frame()
-    if frame is None:
-        raise RuntimeError("Camera read failed (hover step).")
-
     key_pos_fine = _pnp_key_position(
-        frame, target_key, robot, kin, "hover", conf=FINE_CONF_THRESHOLD
+        target_key, robot, kin, get_frame, "hover", conf=FINE_CONF_THRESHOLD
     )
 
     hover_target = np.array([

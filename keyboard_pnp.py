@@ -263,6 +263,53 @@ def detections_from_roboflow(preds: list[dict]) -> Dict[str, Tuple[float, float]
     return {cls: (float(p["x"]), float(p["y"])) for cls, p in best.items()}
 
 
+def detections_from_roboflow_accumulated(
+    prediction_batches: list[list[dict]],
+    min_hits: int = 1,
+) -> Dict[str, Tuple[float, float]]:
+    """
+    Merge multiple Roboflow prediction batches into {label: (u, v)} centroids.
+
+    Within each frame, keeps the highest-confidence detection per canonical
+    layout key. Across frames, returns a confidence-weighted centroid for keys
+    seen in at least min_hits frames.
+    """
+    accum: Dict[str, dict[str, float]] = {}
+
+    for preds in prediction_batches:
+        frame_best: Dict[str, dict] = {}
+        for pred in preds:
+            cls = pred["class"]
+            if cls.lower() == "keyboard":
+                continue
+            key = _normalize(cls)
+            if key not in LAYOUT:
+                continue
+            if key not in frame_best or pred["confidence"] > frame_best[key]["confidence"]:
+                frame_best[key] = pred
+
+        for key, pred in frame_best.items():
+            conf = max(float(pred.get("confidence", 0.0)), 1e-6)
+            state = accum.setdefault(
+                key,
+                {"x": 0.0, "y": 0.0, "weight": 0.0, "hits": 0.0},
+            )
+            state["x"] += float(pred["x"]) * conf
+            state["y"] += float(pred["y"]) * conf
+            state["weight"] += conf
+            state["hits"] += 1.0
+
+    merged: Dict[str, Tuple[float, float]] = {}
+    for key, state in accum.items():
+        if state["hits"] < min_hits:
+            continue
+        merged[key] = (
+            state["x"] / state["weight"],
+            state["y"] / state["weight"],
+        )
+    return merged
+
+
 def solve_keyboard_pose(
     detections: Dict[str, Tuple[float, float]],
     camera_k: np.ndarray,
