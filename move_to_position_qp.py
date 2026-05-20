@@ -67,6 +67,8 @@ MAX_JOINT_SPEED_DEG_S  = 110.0
 MAX_JOINT_ACCEL_DEG_S2 = 700.0
 STOP_JOINT_SPEED_DEG_S = 5.0
 COMMAND_DEADBAND_DEG   = 0.015
+INTEGRATOR_MAX_DT_S    = 0.05
+MAX_CMD_AHEAD_DEG      = 4.0
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -261,6 +263,27 @@ def _write_active_q_rad(q_deg: np.ndarray, active_joints: list[str], q_active_ra
     return q
 
 
+def _integrate_command(
+    q_cmd_deg: np.ndarray,
+    q_actual_deg: np.ndarray,
+    qdot_rad_s: np.ndarray,
+    active_joints: list[str],
+    control_dt_s: float,
+) -> np.ndarray:
+    dt = float(np.clip(control_dt_s, 0.0, INTEGRATOR_MAX_DT_S))
+    q_next = _write_active_q_rad(
+        q_cmd_deg,
+        active_joints,
+        _active_q_rad(q_cmd_deg, active_joints) + np.asarray(qdot_rad_s, dtype=float) * dt,
+    )
+
+    for name in active_joints:
+        idx = JOINT_INDEX[name]
+        actual = float(q_actual_deg[idx])
+        q_next[idx] = float(np.clip(q_next[idx], actual - MAX_CMD_AHEAD_DEG, actual + MAX_CMD_AHEAD_DEG))
+    return q_next
+
+
 # ── QP solver (verbatim from move_to_position_new.py) ────────────────────────
 
 def _solve_box_qp(H: np.ndarray, g: np.ndarray,
@@ -375,9 +398,10 @@ def _controller_step(
     target_pos: np.ndarray,
     elapsed_s: float,
     duration_s: float,
+    control_dt_s: float,
 ) -> tuple[np.ndarray, np.ndarray, dict]:
     """Matches move_to_position_new.py's _controller_step (cfg replaced by module constants)."""
-    dt          = 1.0 / FPS
+    dt          = max(float(np.clip(control_dt_s, 0.0, INTEGRATOR_MAX_DT_S)), 1e-6)
     T_curr      = kin.forward_kinematics(q_deg)
     p_curr      = T_curr[:3, 3]
     tau         = elapsed_s / max(duration_s, 1e-6)
@@ -445,11 +469,14 @@ def smooth_move(robot, kin: SO101Kinematics, target_pos: np.ndarray) -> dict:
     prev_qdot  = np.zeros(len(kin.active_joints), dtype=float)
     stable     = 0
     start_t    = time.perf_counter()
+    last_tick_t = start_t - dt
     last_print = -1e9
 
     while True:
         tick_t  = time.perf_counter()
         elapsed = tick_t - start_t
+        control_dt_s = float(np.clip(tick_t - last_tick_t, 0.0, INTEGRATOR_MAX_DT_S))
+        last_tick_t = tick_t
 
         obs      = robot.get_observation()
         q_actual = kin.clip_joints(_joints_from_obs(obs))
@@ -457,14 +484,11 @@ def smooth_move(robot, kin: SO101Kinematics, target_pos: np.ndarray) -> dict:
         # qdot is computed from q_actual (real FK / error), but integrated into
         # q_cmd (the accumulator), not back onto q_actual.
         _, qdot, info = _controller_step(
-            kin, q_actual, q_ref, prev_qdot, p_start, target, elapsed, duration
+            kin, q_actual, q_ref, prev_qdot, p_start, target, elapsed, duration, control_dt_s
         )
         prev_qdot = qdot
 
-        q_cmd = _write_active_q_rad(
-            q_cmd, kin.active_joints,
-            _active_q_rad(q_cmd, kin.active_joints) + qdot * dt,
-        )
+        q_cmd = _integrate_command(q_cmd, q_actual, qdot, kin.active_joints, control_dt_s)
         q_cmd = kin.clip_joints(q_cmd)
 
         action = {f"{name}.pos": float(q_cmd[index]) for index, name in enumerate(MOTOR_NAMES)}
