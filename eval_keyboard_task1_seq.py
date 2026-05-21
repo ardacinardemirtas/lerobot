@@ -165,6 +165,9 @@ class SequenceEvalGUI:
         self._status    = "Finding keyboard home …"
         self._show_pnp  = True
 
+        self._start_event      = threading.Event()
+        self._waiting_to_start = False
+
         self._det = _DetectionWorker()
         self._det.start()
 
@@ -342,15 +345,20 @@ class SequenceEvalGUI:
             pos = find_kb_home(self.robot, self.kin,
                                lambda: self._get_frame(fresh=True))
             self._kb_home_set = True
+            self._waiting_to_start = True
             self._status = (
                 f"KB_HOME set  ({pos[0]:+.3f}, {pos[1]:+.3f}, {pos[2]:+.3f}) m"
-                f"  — starting episode …"
+                f"  — press Space to begin"
             )
         except Exception as exc:
             self._status = f"KB_HOME failed: {exc}"
             return
-        # Auto-start episode immediately after KB_HOME is found (inline — we're
-        # already inside the press thread, so no new thread needed)
+        self._start_event.clear()
+        while not self._start_event.wait(timeout=0.1):
+            if self._cancel_evt.is_set():
+                self._waiting_to_start = False
+                return
+        self._waiting_to_start = False
         self._start_episode(inline=True)
 
     # ── Drawing ───────────────────────────────────────────────────────────────
@@ -473,7 +481,7 @@ class SequenceEvalGUI:
         print(f"  Sequence: {' → '.join(k.upper() for k in TASK_SEQUENCE)}")
         print(f"  Points per key: {POINTS_PER_KEY}  |  Time limit: {TIME_LIMIT_S}s")
         print(f"  Camera {CAMERA_INDEX}  {CAMERA_WIDTH}x{CAMERA_HEIGHT}")
-        print( "  Finding keyboard home and starting automatically …")
+        print( "  Finding keyboard home — press Space when ready to begin …")
         print(f"{'─' * 60}\n")
 
         # Auto-find KB_HOME and start episode without any user input
@@ -524,9 +532,11 @@ class SequenceEvalGUI:
             elif ch == 96:                     # ` = overlay
                 self._show_pnp = not self._show_pnp
                 self._status = f"PnP overlay {'ON' if self._show_pnp else 'OFF'}"
-            elif ch == 32:                     # Space = restart episode manually
-                if not self._episode_active:
-                    self._go_kb_home()         # re-find KB_HOME then auto-start
+            elif ch == 32:                     # Space = begin / restart
+                if self._waiting_to_start:
+                    self._start_event.set()
+                elif self._episode_done and not self._episode_active:
+                    self._go_kb_home()         # re-find KB_HOME, then wait for Space again
 
         self._cancel()
         self._det.stop()

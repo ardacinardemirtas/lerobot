@@ -243,6 +243,9 @@ class Eval3GUI:
         self._status   = "Finding keyboard home …"
         self._show_pnp = True
 
+        self._start_event      = threading.Event()
+        self._waiting_to_start = False
+
         self._det = _DetectionWorker()
         self._det.start()
 
@@ -281,11 +284,18 @@ class Eval3GUI:
             find_kb_home(self.robot, self.kin,
                          lambda: self._get_frame(fresh=True))
             self._kb_home_set = True
-            self._status = "KB_HOME set — starting rollouts …"
+            self._waiting_to_start = True
+            self._status = "KB_HOME set — press Space to begin"
         except Exception as exc:
             self._status = f"KB_HOME failed: {exc}"
             return
         if then_start:
+            self._start_event.clear()
+            while not self._start_event.wait(timeout=0.1):
+                if self._cancel_evt.is_set():
+                    self._waiting_to_start = False
+                    return
+            self._waiting_to_start = False
             self._run_all_rollouts()
 
     # ── Reset home ────────────────────────────────────────────────────────────
@@ -576,7 +586,7 @@ class Eval3GUI:
                     cv2.FONT_HERSHEY_SIMPLEX, 0.44, (255, 255, 255), 1, cv2.LINE_AA)
         cv2.putText(
             frame,
-            ",=home  .=KB_home  `=overlay  Esc=quit",
+            "Space=start  ,=home  .=KB_home  `=overlay  Esc=quit",
             (8, h - bar_h + 36),
             cv2.FONT_HERSHEY_SIMPLEX, 0.30, (160, 220, 160), 1, cv2.LINE_AA,
         )
@@ -648,6 +658,9 @@ class Eval3GUI:
 
             if ch == 27:
                 break
+            elif ch == 32:                     # Space = begin
+                if self._waiting_to_start:
+                    self._start_event.set()
             elif ch == ord(","):
                 self._go_home()
             elif ch == ord("."):
