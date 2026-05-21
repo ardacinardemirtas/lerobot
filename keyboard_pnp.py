@@ -212,6 +212,19 @@ def reset_keyboard_cache() -> None:
     print("[PnP cache] cleared")
 
 
+def get_cached_key_position(key: str) -> Optional[np.ndarray]:
+    """
+    Return the base-frame position of a key using the cached keyboard pose.
+    Returns None if the cache is empty or the key is not in the layout.
+    Does not make any network or camera calls.
+    """
+    if _T_base_keyboard_cache is None:
+        return None
+    canonical = _normalize(key)
+    positions = _positions_from_T(_T_base_keyboard_cache)
+    return positions.get(canonical)
+
+
 def get_keyboard_center_world() -> Optional[np.ndarray]:
     """
     Return the keyboard surface centre in robot base frame (metres).

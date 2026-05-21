@@ -69,6 +69,7 @@ from press_key_pnp import (  # noqa: E402
     press_key,
     find_kb_home,
     return_to_kb_home,
+    prewarm_keyboard_cache,
     ROBOFLOW_API_KEY,
     INTERMEDIATE_OFFSET_M,
     HOVER_OFFSET_M,
@@ -340,6 +341,13 @@ class Eval3GUI:
                 f"sentence='{sentence}'  budget={rollout_time_s:.0f}s"
             )
 
+            # Populate keyboard pose cache from KB_HOME before typing starts.
+            # The wide field of view there gives the most PnP correspondences,
+            # so skip_observe can rely on a high-quality cached pose from key 1.
+            prewarm_keyboard_cache(
+                self.robot, self.kin, lambda: self._get_frame(fresh=True)
+            )
+
             for ki, (robot_key, display_char) in enumerate(key_seq):
                 if self._cancel_evt.is_set():
                     break
@@ -359,11 +367,14 @@ class Eval3GUI:
                         lambda: self._get_frame(fresh=True),
                         lift=False,
                         cancel_event=self._cancel_evt,
+                        skip_observe=True,
                     )
                     if not self._cancel_evt.is_set():
                         self._typed_chars.append(display_char)
                 except Exception as exc:
-                    self._status = f"Press error [{robot_key}]: {str(exc)[:60]}"
+                    msg = f"Press error [{robot_key}]: {str(exc)[:80]}"
+                    self._status = msg
+                    print(f"[Eval3] {msg}")
                 finally:
                     with self._press_lock:
                         self._active_key = None

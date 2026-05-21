@@ -83,6 +83,7 @@ from keyboard_pnp import (  # noqa: E402
     get_key_positions_in_base_frame,
     locate_key_in_base_frame,
     get_keyboard_home_position,
+    get_cached_key_position,
 )
 from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
 
@@ -522,6 +523,35 @@ def return_to_kb_home(robot: SO101Follower, duration: float = 2.0) -> bool:
     return True
 
 
+def prewarm_keyboard_cache(
+    robot: SO101Follower,
+    kin: SO101Kinematics,
+    get_frame,
+) -> bool:
+    """
+    Detect keys from the current position and populate the keyboard pose cache.
+    Call this from KB_HOME at the start of each rollout: the wide field of view
+    there gives the most key correspondences for a robust PnP solve, so the
+    cache that skip_observe relies on is as accurate as possible from the start.
+    Returns True if the cache was (re-)populated, False on detection failure.
+    """
+    frame = get_frame()
+    if frame is None:
+        return False
+    try:
+        T_bc  = _T_base_cam(robot, kin)
+        preds = detect_keys(frame, FINE_CONF_THRESHOLD)
+        dets  = detections_from_roboflow(preds)
+        if not dets:
+            return False
+        get_key_positions_in_base_frame(dets, T_bc, CAMERA_K, DIST_COEFFS)
+        print("  [prewarm] keyboard cache populated")
+        return True
+    except Exception as exc:
+        print(f"  [prewarm] failed ({exc}), will detect on first press")
+        return False
+
+
 # ─── Three-step press ─────────────────────────────────────────────────────────
 
 def press_key(
@@ -531,6 +561,7 @@ def press_key(
     get_frame,
     lift: bool = True,
     cancel_event: threading.Event | None = None,
+    skip_observe: bool = False,
 ) -> None:
     """
     Three-step PnP key press: observe → hover → press.
@@ -539,6 +570,9 @@ def press_key(
         PnP from the current position → move to INTERMEDIATE_OFFSET_M above
         the key.  This gives a near-top-down camera view with the full keyboard
         visible — ideal geometry for PnP.
+        Skipped when skip_observe=True and the keyboard pose cache is warm:
+        the arm moves directly to the cached hover height, saving one API call
+        and one long arm movement per key (~40% faster for sentence typing).
 
     Step 2  (Hover)
         Stabilise, re-detect with a lower confidence threshold (more keys
@@ -554,24 +588,70 @@ def press_key(
     robot        : connected SO101Follower
     kin          : SO101Kinematics instance
     get_frame    : callable() → np.ndarray  (camera frame provider)
-    lift         : if True, lift back to hover height after press
+    lift         : if True, return all the way to KB_HOME after press
     cancel_event : optional threading.Event to abort the move
+    skip_observe : if True, skip Step 1 when the keyboard pose cache is warm
     """
+
+    cached_pos = get_cached_key_position(target_key) if skip_observe else None
+
+    if cached_pos is not None:
+        # ── Fast path (cache warm): skip both observe and fine-detect ─────────
+        # Move directly to hover using the cached key position, then press.
+        # No API calls needed.  _press_down stall-detection handles any Z error.
+        hover_target = np.array([
+            cached_pos[0] + KEY_X_CORRECTION_M,
+            cached_pos[1] + KEY_Y_CORRECTION_M,
+            cached_pos[2] + HOVER_OFFSET_M,
+        ])
+        hover_target = np.clip(hover_target, WS_MIN, WS_MAX)
+        result = _move(robot, kin, hover_target, cancel_event=cancel_event)
+        if result == "cancelled":
+            return
+
+        time.sleep(0.02)
+
+        press_target = np.array([
+            cached_pos[0] + KEY_X_CORRECTION_M,
+            cached_pos[1] + KEY_Y_CORRECTION_M,
+            cached_pos[2] - PRESS_BELOW_M,
+        ])
+        press_target = np.clip(press_target, WS_MIN, WS_MAX)
+        result = _press_down(robot, kin, press_target, cancel_event)
+        if result == "cancelled":
+            return
+
+        result = _move(robot, kin, hover_target, cancel_event=cancel_event)
+        if result == "cancelled":
+            return
+
+        if lift:
+            kb_home = get_keyboard_home_position(KB_HOME_HEIGHT_M)
+            if kb_home is not None:
+                lift_target = np.clip(kb_home, WS_MIN, WS_MAX)
+                result = _move(robot, kin, lift_target, cancel_event=cancel_event)
+                if result == "cancelled":
+                    return
+                if _kb_home_q_deg is not None:
+                    _move_to_joints(robot, _kb_home_q_deg, duration=1.0)
+                else:
+                    _tilt_to_look_down(robot)
+        return
+
+    # ── Slow path: full observe → hover → press ───────────────────────────────
+    obs_target = None
 
     # ── Step 1: Observe — PnP from current position, move to intermediate ────
     frame = get_frame()
     if frame is None:
         raise RuntimeError("Camera read failed.")
-
     key_pos_obs = _pnp_key_position(frame, target_key, robot, kin, "observe")
-
     obs_target = np.array([
         key_pos_obs[0] + KEY_X_CORRECTION_M,
         key_pos_obs[1] + KEY_Y_CORRECTION_M,
         key_pos_obs[2] + INTERMEDIATE_OFFSET_M,
     ])
     obs_target = np.clip(obs_target, WS_MIN, WS_MAX)
-
     result = _move(robot, kin, obs_target, cancel_event=cancel_event)
     if result == "cancelled":
         return
@@ -612,15 +692,20 @@ def press_key(
     if result == "cancelled":
         return
 
-    # ── Return to KB_HOME (reverse path) ─────────────────────────────────────
-    if lift:
-        result = _move(robot, kin, hover_target, cancel_event=cancel_event)
-        if result == "cancelled":
-            return
+    # ── Always lift to hover so the camera clears the keyboard surface ────────
+    # Without this, the next press_key call captures a frame centimetres from
+    # the keyboard; in low light Roboflow returns zero detections and the early
+    # guard fires before the cache is consulted.
+    result = _move(robot, kin, hover_target, cancel_event=cancel_event)
+    if result == "cancelled":
+        return
 
-        result = _move(robot, kin, obs_target, cancel_event=cancel_event)
-        if result == "cancelled":
-            return
+    # ── Optionally return all the way to KB_HOME ──────────────────────────────
+    if lift:
+        if obs_target is not None:
+            result = _move(robot, kin, obs_target, cancel_event=cancel_event)
+            if result == "cancelled":
+                return
 
         kb_home = get_keyboard_home_position(KB_HOME_HEIGHT_M)
         if kb_home is not None:
