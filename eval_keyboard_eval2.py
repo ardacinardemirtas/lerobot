@@ -26,7 +26,6 @@ Controls
 """
 
 import os
-import random
 import threading
 import time
 from pathlib import Path
@@ -80,36 +79,12 @@ from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
 
 # ── Task definition ───────────────────────────────────────────────────────────
 
-# Fixed random sentence (a-z + space), exactly 16 characters for 16 rollouts.
-# Generated with seed=42 — identical across groups.
-_SENTENCE_SEED = 42
-_ROLLOUT_COUNT = 16
-_ROLLOUT_TIME_S = 10.0
+_ROLLOUT_COUNT      = 16
+_ROLLOUT_TIME_S     = 10.0
 _POINTS_PER_ROLLOUT = 3.125
 
 # QWERTY → QWERTZ (German layout keyboard)
 _QWERTY_TO_QWERTZ: dict[str, str] = {"y": "z", "z": "y"}
-
-
-def _generate_sequence(n: int = _ROLLOUT_COUNT, seed: int = _SENTENCE_SEED) -> list[str]:
-    """Generate a fixed random sequence of n characters from a-z + space."""
-    rng = random.Random(seed)
-    chars = list("abcdefghijklmnoprstuvwx")  # a-z without y/z (swapped on QWERTZ)
-    chars += ["y", "z", "space"]
-    # Build sentence: words of 3-6 letters separated by spaces, total n chars
-    seq: list[str] = []
-    while len(seq) < n:
-        word_len = rng.randint(3, 6)
-        for _ in range(word_len):
-            seq.append(rng.choice(list("abcdefghijklmnopqrstuvwxyz")))
-            if len(seq) == n:
-                break
-        if len(seq) < n:
-            seq.append("space")
-    return seq[:n]
-
-
-TASK_SEQUENCE = _generate_sequence()
 
 _WIN      = "SO-101  Eval 2  [a-z key press]"
 _KEY_HOME = 2359296
@@ -201,6 +176,11 @@ class Eval2GUI:
         # Per-rollout result log
         self._results: list[dict] = []
 
+        # Key input from evaluator (set from main GUI thread)
+        self._waiting_for_input = False
+        self._input_event       = threading.Event()
+        self._input_key:        Optional[str] = None
+
         self._status   = "Finding keyboard home …"
         self._show_pnp = True
 
@@ -209,15 +189,18 @@ class Eval2GUI:
 
     # ── Frame provider ────────────────────────────────────────────────────────
 
-    def _get_frame(self, fresh: bool = False) -> Optional[np.ndarray]:
+    def _get_frame(self, fresh: bool = False, timeout: float = 5.0) -> Optional[np.ndarray]:
         if not fresh:
             with self._frame_lock:
                 return self._latest_frame.copy() if self._latest_frame is not None else None
         deadline = time.monotonic()
+        cutoff   = deadline + timeout
         while True:
             with self._frame_lock:
                 if self._frame_ts > deadline and self._latest_frame is not None:
                     return self._latest_frame.copy()
+            if time.monotonic() > cutoff:
+                return None   # camera stalled (low-light auto-exposure slowdown)
             time.sleep(0.005)
 
     # ── KB_HOME ───────────────────────────────────────────────────────────────
@@ -279,7 +262,22 @@ class Eval2GUI:
             if self._cancel_evt.is_set():
                 break
 
-            key_label = TASK_SEQUENCE[idx]
+            # ── Wait for evaluator to type the target key ─────────────────
+            self._input_event.clear()
+            self._input_key         = None
+            self._waiting_for_input = True
+            self._rollout_active    = False
+            self._status = (
+                f"Rollout {idx+1}/{_ROLLOUT_COUNT}  score={self._score:.1f}"
+                f"  — type target key (a-z) on host keyboard …"
+            )
+            while not self._input_event.wait(timeout=0.1):
+                if self._cancel_evt.is_set():
+                    self._waiting_for_input = False
+                    return
+            self._waiting_for_input = False
+
+            key_label   = self._input_key          # 'a'–'z'
             robot_label = _QWERTY_TO_QWERTZ.get(key_label, key_label)
 
             self._rollout_idx    = idx
@@ -292,27 +290,46 @@ class Eval2GUI:
                 f"  score={self._score:.1f}  time={remaining_budget:.0f}s"
             )
 
-            with self._press_lock:
-                self._active_key = robot_label
+            _MAX_ATTEMPTS = 3
+            success       = False
 
-            success = False
-            try:
-                press_key(
-                    robot_label,
-                    self.robot,
-                    self.kin,
-                    lambda: self._get_frame(fresh=True),
-                    lift=False,
-                    cancel_event=self._cancel_evt,
-                )
-                elapsed = time.monotonic() - self._rollout_start_t
-                if not self._cancel_evt.is_set() and elapsed <= _ROLLOUT_TIME_S:
-                    success = True
-            except Exception as exc:
-                self._status = f"Press error: {exc}"
+            for attempt in range(_MAX_ATTEMPTS):
+                if self._cancel_evt.is_set():
+                    break
+                if time.monotonic() - self._rollout_start_t >= _ROLLOUT_TIME_S:
+                    break
 
-            with self._press_lock:
-                self._active_key = None
+                with self._press_lock:
+                    self._active_key = robot_label
+
+                try:
+                    press_key(
+                        robot_label,
+                        self.robot,
+                        self.kin,
+                        lambda: self._get_frame(fresh=True),
+                        lift=False,
+                        cancel_event=self._cancel_evt,
+                    )
+                    elapsed = time.monotonic() - self._rollout_start_t
+                    if not self._cancel_evt.is_set() and elapsed <= _ROLLOUT_TIME_S:
+                        success = True
+                except Exception as exc:
+                    self._status = (
+                        f"Press error [{robot_label}] "
+                        f"({attempt + 1}/{_MAX_ATTEMPTS}): {str(exc)[:50]}"
+                    )
+                    if attempt < _MAX_ATTEMPTS - 1:
+                        try:
+                            return_to_kb_home(self.robot)
+                        except Exception:
+                            pass
+                finally:
+                    with self._press_lock:
+                        self._active_key = None
+
+                if success:
+                    break
 
             elapsed = time.monotonic() - self._rollout_start_t
             if success:
@@ -434,14 +451,10 @@ class Eval2GUI:
         cv2.putText(frame, score_str, (8, 62),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.46, (255, 220, 80), 1, cv2.LINE_AA)
 
-        # Sequence preview (show next few keys)
-        preview_keys = TASK_SEQUENCE[self._rollout_idx:self._rollout_idx + 8]
-        preview_str  = "  ".join(
-            f"[{k.upper()}]" if i == 0 and self._rollout_active else k.upper()
-            for i, k in enumerate(preview_keys)
-        )
-        cv2.putText(frame, preview_str, (8, 82),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.40, (180, 180, 255), 1, cv2.LINE_AA)
+        # Waiting-for-input hint
+        if self._waiting_for_input:
+            cv2.putText(frame, "type a-z on host keyboard …", (8, 82),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.46, (255, 200, 60), 1, cv2.LINE_AA)
 
         # Result dots for completed rollouts
         dot_x, dot_y = 8, 100
@@ -482,13 +495,11 @@ class Eval2GUI:
     def run(self) -> None:
         cv2.namedWindow(_WIN, cv2.WINDOW_NORMAL)
 
-        seq_display = " ".join(
-            k if k == "space" else k for k in TASK_SEQUENCE
-        )
         print(f"{'─'*55}")
         print("  Eval 2 — a-z key press  (16 rollouts × 3.125 pts)")
-        print(f"  Sequence (seed={_SENTENCE_SEED}): {seq_display}")
         print(f"  Time per rollout: {_ROLLOUT_TIME_S}s")
+        print("  Type the target letter (a-z) on the host keyboard")
+        print(f"  to start each rollout.")
         print(f"{'─'*55}\n")
 
         # Auto-start: find KB_HOME then run all rollouts
@@ -516,6 +527,9 @@ class Eval2GUI:
 
             if ch == 27:                       # Esc
                 break
+            elif self._waiting_for_input and ord("a") <= ch <= ord("z"):
+                self._input_key = chr(ch)
+                self._input_event.set()
             elif ch == ord(","):
                 self._go_home()
             elif ch == ord("."):

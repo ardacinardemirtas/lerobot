@@ -248,15 +248,18 @@ class Eval3GUI:
 
     # ── Frame provider ────────────────────────────────────────────────────────
 
-    def _get_frame(self, fresh: bool = False) -> Optional[np.ndarray]:
+    def _get_frame(self, fresh: bool = False, timeout: float = 5.0) -> Optional[np.ndarray]:
         if not fresh:
             with self._frame_lock:
                 return self._latest_frame.copy() if self._latest_frame is not None else None
         deadline = time.monotonic()
+        cutoff   = deadline + timeout
         while True:
             with self._frame_lock:
                 if self._frame_ts > deadline and self._latest_frame is not None:
                     return self._latest_frame.copy()
+            if time.monotonic() > cutoff:
+                return None   # camera stalled (low-light auto-exposure slowdown)
             time.sleep(0.005)
 
     # ── KB_HOME ───────────────────────────────────────────────────────────────
@@ -348,25 +351,49 @@ class Eval3GUI:
                     break
 
                 self._char_idx = ki
-                with self._press_lock:
-                    self._active_key = robot_key
+                _MAX_ATTEMPTS  = 3
+                pressed        = False
 
-                try:
-                    press_key(
-                        robot_key,
-                        self.robot,
-                        self.kin,
-                        lambda: self._get_frame(fresh=True),
-                        lift=False,
-                        cancel_event=self._cancel_evt,
-                    )
-                    if not self._cancel_evt.is_set():
-                        self._typed_chars.append(display_char)
-                except Exception as exc:
-                    self._status = f"Press error [{robot_key}]: {str(exc)[:60]}"
-                finally:
+                for attempt in range(_MAX_ATTEMPTS):
+                    if self._cancel_evt.is_set():
+                        break
+                    if time.monotonic() - self._rollout_start_t >= rollout_time_s:
+                        break
+
                     with self._press_lock:
-                        self._active_key = None
+                        self._active_key = robot_key
+
+                    try:
+                        press_key(
+                            robot_key,
+                            self.robot,
+                            self.kin,
+                            lambda: self._get_frame(fresh=True),
+                            lift=False,
+                            cancel_event=self._cancel_evt,
+                        )
+                        pressed = True
+                    except Exception as exc:
+                        self._status = (
+                            f"Press error [{robot_key}] "
+                            f"({attempt + 1}/{_MAX_ATTEMPTS}): {str(exc)[:50]}"
+                        )
+                        # Lift back to KB_HOME so the camera regains a clear
+                        # top-down view and the serial link stays active.
+                        if attempt < _MAX_ATTEMPTS - 1:
+                            try:
+                                return_to_kb_home(self.robot)
+                            except Exception:
+                                pass
+                    finally:
+                        with self._press_lock:
+                            self._active_key = None
+
+                    if pressed:
+                        break
+
+                if pressed and not self._cancel_evt.is_set():
+                    self._typed_chars.append(display_char)
 
             with self._press_lock:
                 self._active_key = None

@@ -170,15 +170,18 @@ class SequenceEvalGUI:
 
     # ── Frame provider ────────────────────────────────────────────────────────
 
-    def _get_frame(self, fresh: bool = False) -> Optional[np.ndarray]:
+    def _get_frame(self, fresh: bool = False, timeout: float = 5.0) -> Optional[np.ndarray]:
         if not fresh:
             with self._frame_lock:
                 return self._latest_frame.copy() if self._latest_frame is not None else None
         deadline = time.monotonic()
+        cutoff   = deadline + timeout
         while True:
             with self._frame_lock:
                 if self._frame_ts > deadline and self._latest_frame is not None:
                     return self._latest_frame.copy()
+            if time.monotonic() > cutoff:
+                return None   # camera stalled (low-light auto-exposure slowdown)
             time.sleep(0.005)
 
     # ── Episode control ───────────────────────────────────────────────────────
@@ -226,29 +229,50 @@ class SequenceEvalGUI:
                 f"[{idx+1}/{len(TASK_SEQUENCE)}]  Pressing '{key}' …"
                 f"  score: {self._score:.0f}  time left: {remaining:.0f}s"
             )
-            with self._press_lock:
-                self._active_key = key
+            _MAX_ATTEMPTS = 3
+            pressed       = False
 
-            try:
-                press_key(
-                    key,
-                    self.robot,
-                    self.kin,
-                    lambda: self._get_frame(fresh=True),
-                    lift=False,
-                    cancel_event=self._cancel_evt,
-                )
-            except Exception as exc:
-                self._status = f"Press failed: {exc}"
+            for attempt in range(_MAX_ATTEMPTS):
+                if self._cancel_evt.is_set():
+                    break
+                if time.monotonic() - self._ep_start_t >= TIME_LIMIT_S:
+                    break
+
+                with self._press_lock:
+                    self._active_key = key
+
+                try:
+                    press_key(
+                        key,
+                        self.robot,
+                        self.kin,
+                        lambda: self._get_frame(fresh=True),
+                        lift=False,
+                        cancel_event=self._cancel_evt,
+                    )
+                    pressed = True
+                except Exception as exc:
+                    self._status = (
+                        f"Press failed [{key}] "
+                        f"({attempt + 1}/{_MAX_ATTEMPTS}): {str(exc)[:50]}"
+                    )
+                    if attempt < _MAX_ATTEMPTS - 1:
+                        try:
+                            return_to_kb_home(self.robot)
+                        except Exception:
+                            pass
+                finally:
+                    with self._press_lock:
+                        self._active_key = None
+
+                if pressed:
+                    break
+
+            if not pressed:
                 self._episode_active = False
                 self._episode_done   = True
                 self._final_time     = time.monotonic() - self._ep_start_t
-                with self._press_lock:
-                    self._active_key = None
                 return
-
-            with self._press_lock:
-                self._active_key = None
 
             if self._cancel_evt.is_set():
                 self._status = "Episode cancelled"
