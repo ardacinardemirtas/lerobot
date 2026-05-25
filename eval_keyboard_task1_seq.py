@@ -78,6 +78,8 @@ _WIN      = "SO-101  Eval 1 Task (2)  [Space→Enter→R→L]"
 _KEY_HOME = 2359296
 _KEY_F5   = 7667712
 
+_CAM_RECONNECT_AFTER = 30  # consecutive read failures before auto-reconnect
+
 
 # ── Detection worker ──────────────────────────────────────────────────────────
 
@@ -167,6 +169,11 @@ class SequenceEvalGUI:
 
         self._start_event      = threading.Event()
         self._waiting_to_start = False
+        self._restart_mode     = False  # auto-start after KB_HOME on restart
+
+        self._cam_fail_count   = 0
+        self._cam_reconnecting = False
+        self._cam_index        = CAMERA_INDEX
 
         self._det = _DetectionWorker()
         self._det.start()
@@ -221,7 +228,10 @@ class SequenceEvalGUI:
             # Time check before each press
             elapsed = time.monotonic() - self._ep_start_t
             if elapsed >= TIME_LIMIT_S:
-                self._status = f"Time's up!  Score: {self._score:.1f} / {len(TASK_SEQUENCE)*POINTS_PER_KEY:.1f}"
+                self._status = (
+                    f"Time's up!  Score: {self._score:.1f} / {len(TASK_SEQUENCE)*POINTS_PER_KEY:.1f}"
+                    f"  — press Space to restart"
+                )
                 self._episode_active = False
                 self._episode_done   = True
                 self._final_time     = elapsed
@@ -298,7 +308,7 @@ class SequenceEvalGUI:
         elapsed = time.monotonic() - self._ep_start_t
         self._status = (
             f"Complete!  Score: {self._score:.0f} / {len(TASK_SEQUENCE)*POINTS_PER_KEY:.0f}"
-            f"  in {elapsed:.1f}s"
+            f"  in {elapsed:.1f}s  — press Space to restart"
         )
         self._episode_active = False
         self._episode_done   = True
@@ -341,25 +351,80 @@ class SequenceEvalGUI:
 
     def _kb_home_worker(self) -> None:
         self._status = "Finding keyboard home …"
+        auto_start = self._restart_mode
+        self._restart_mode = False
         try:
             pos = find_kb_home(self.robot, self.kin,
                                lambda: self._get_frame(fresh=True))
             self._kb_home_set = True
-            self._waiting_to_start = True
-            self._status = (
-                f"KB_HOME set  ({pos[0]:+.3f}, {pos[1]:+.3f}, {pos[2]:+.3f}) m"
-                f"  — press Space to begin"
-            )
+            if auto_start:
+                self._status = (
+                    f"KB_HOME set  ({pos[0]:+.3f}, {pos[1]:+.3f}, {pos[2]:+.3f}) m"
+                    f"  — starting …"
+                )
+            else:
+                self._waiting_to_start = True
+                self._status = (
+                    f"KB_HOME set  ({pos[0]:+.3f}, {pos[1]:+.3f}, {pos[2]:+.3f}) m"
+                    f"  — press Space to begin"
+                )
         except Exception as exc:
             self._status = f"KB_HOME failed: {exc}"
             return
-        self._start_event.clear()
-        while not self._start_event.wait(timeout=0.1):
-            if self._cancel_evt.is_set():
-                self._waiting_to_start = False
+        if auto_start:
+            self._start_episode(inline=True)
+        else:
+            self._start_event.clear()
+            while not self._start_event.wait(timeout=0.1):
+                if self._cancel_evt.is_set():
+                    self._waiting_to_start = False
+                    return
+            self._waiting_to_start = False
+            self._start_episode(inline=True)
+
+    def _reconnect_camera(self) -> None:
+        self._status = "Reconnecting camera …"
+
+        # Record which indices are OTHER cameras so we don't accidentally grab them
+        other_cams: set[int] = set()
+        for idx in range(8):
+            if idx == self._cam_index:
+                continue
+            probe = cv2.VideoCapture(idx)
+            if probe.isOpened():
+                other_cams.add(idx)
+            probe.release()
+
+        self.cap.release()
+
+        # Candidates: try original index first, then any index not taken by another camera
+        candidates = [self._cam_index] + [
+            i for i in range(8) if i not in other_cams and i != self._cam_index
+        ]
+
+        for attempt in range(1, 6):
+            time.sleep(1.0)
+            self._status = f"Reconnecting camera (attempt {attempt}/5) …"
+            for idx in candidates:
+                new_cap = cv2.VideoCapture(idx)
+                if not new_cap.isOpened():
+                    new_cap.release()
+                    continue
+                ret, _ = new_cap.read()   # confirm it actually delivers frames
+                if not ret:
+                    new_cap.release()
+                    continue
+                new_cap.set(cv2.CAP_PROP_FRAME_WIDTH,  CAMERA_WIDTH)
+                new_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
+                self.cap = new_cap
+                self._cam_index = idx
+                self._cam_fail_count = 0
+                self._status = f"Camera reconnected (index {idx})"
+                self._cam_reconnecting = False
                 return
-        self._waiting_to_start = False
-        self._start_episode(inline=True)
+
+        self._status = "Camera reconnect failed — try [C] again"
+        self._cam_reconnecting = False
 
     # ── Drawing ───────────────────────────────────────────────────────────────
 
@@ -463,7 +528,7 @@ class SequenceEvalGUI:
                     cv2.FONT_HERSHEY_SIMPLEX, 0.46, (255, 255, 255), 1, cv2.LINE_AA)
         cv2.putText(
             frame,
-            f"Space=restart  ,=home  .=KB_home  `=overlay  Esc=quit  "
+            f"Space=restart  ,=home  .=KB_home  `=overlay  C=cam  Esc=quit  "
             f"observe={INTERMEDIATE_OFFSET_M*100:.0f}cm → hover={HOVER_OFFSET_M*100:.0f}cm",
             (8, h - bar_h + 40),
             cv2.FONT_HERSHEY_SIMPLEX, 0.30, (160, 220, 160), 1, cv2.LINE_AA,
@@ -488,11 +553,25 @@ class SequenceEvalGUI:
         self._go_kb_home()
 
         while True:
-            ret, frame = self.cap.read()
-            if not ret:
+            if self._cam_reconnecting:
                 frame = np.zeros((CAMERA_HEIGHT, CAMERA_WIDTH, 3), dtype=np.uint8)
-                cv2.putText(frame, "No camera signal", (60, CAMERA_HEIGHT // 2),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (40, 40, 200), 2)
+                cv2.putText(frame, "Reconnecting camera …", (60, CAMERA_HEIGHT // 2),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (40, 160, 200), 2)
+                ret = False
+            else:
+                ret, frame = self.cap.read()
+                if not ret:
+                    self._cam_fail_count += 1
+                    frame = np.zeros((CAMERA_HEIGHT, CAMERA_WIDTH, 3), dtype=np.uint8)
+                    cv2.putText(frame, "No camera signal", (60, CAMERA_HEIGHT // 2),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (40, 40, 200), 2)
+                    if self._cam_fail_count >= _CAM_RECONNECT_AFTER:
+                        self._cam_fail_count   = 0
+                        self._cam_reconnecting = True
+                        threading.Thread(target=self._reconnect_camera,
+                                         daemon=True).start()
+                else:
+                    self._cam_fail_count = 0
 
             ts = time.monotonic()
             with self._frame_lock:
@@ -532,11 +611,17 @@ class SequenceEvalGUI:
             elif ch == 96:                     # ` = overlay
                 self._show_pnp = not self._show_pnp
                 self._status = f"PnP overlay {'ON' if self._show_pnp else 'OFF'}"
+            elif ch == ord("c"):               # C = reconnect camera
+                if not self._cam_reconnecting:
+                    self._cam_reconnecting = True
+                    threading.Thread(target=self._reconnect_camera,
+                                     daemon=True).start()
             elif ch == 32:                     # Space = begin / restart
                 if self._waiting_to_start:
                     self._start_event.set()
                 elif self._episode_done and not self._episode_active:
-                    self._go_kb_home()         # re-find KB_HOME, then wait for Space again
+                    self._restart_mode = True
+                    self._go_kb_home()         # re-find KB_HOME, then auto-start
 
         self._cancel()
         self._det.stop()
@@ -575,7 +660,7 @@ def main() -> None:
     try:
         app.run()
     finally:
-        cap.release()
+        app.cap.release()   # may differ from cap if reconnected during the session
         robot.disconnect()
         print("Disconnected.")
 

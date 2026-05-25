@@ -90,6 +90,8 @@ _WIN      = "SO-101  Eval 2  [a-z key press]"
 _KEY_HOME = 2359296
 _KEY_F5   = 7667712
 
+_CAM_RECONNECT_AFTER = 30  # consecutive read failures before auto-reconnect
+
 
 # ── Detection worker ──────────────────────────────────────────────────────────
 
@@ -183,6 +185,10 @@ class Eval2GUI:
 
         self._status   = "Finding keyboard home …"
         self._show_pnp = True
+
+        self._cam_fail_count   = 0
+        self._cam_reconnecting = False
+        self._cam_index        = CAMERA_INDEX
 
         self._det = _DetectionWorker()
         self._det.start()
@@ -384,6 +390,43 @@ class Eval2GUI:
             print(f"  {r['rollout']:2d}. {icon}  '{r['key']}'  {r['elapsed_s']:.1f}s")
         print(f"{'─'*50}\n")
 
+    def _reconnect_camera(self) -> None:
+        self._status = "Reconnecting camera …"
+        other_cams: set[int] = set()
+        for idx in range(8):
+            if idx == self._cam_index:
+                continue
+            probe = cv2.VideoCapture(idx)
+            if probe.isOpened():
+                other_cams.add(idx)
+            probe.release()
+        self.cap.release()
+        candidates = [self._cam_index] + [
+            i for i in range(8) if i not in other_cams and i != self._cam_index
+        ]
+        for attempt in range(1, 6):
+            time.sleep(1.0)
+            self._status = f"Reconnecting camera (attempt {attempt}/5) …"
+            for idx in candidates:
+                new_cap = cv2.VideoCapture(idx)
+                if not new_cap.isOpened():
+                    new_cap.release()
+                    continue
+                ret, _ = new_cap.read()
+                if not ret:
+                    new_cap.release()
+                    continue
+                new_cap.set(cv2.CAP_PROP_FRAME_WIDTH,  CAMERA_WIDTH)
+                new_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
+                self.cap = new_cap
+                self._cam_index = idx
+                self._cam_fail_count = 0
+                self._status = f"Camera reconnected (index {idx})"
+                self._cam_reconnecting = False
+                return
+        self._status = "Camera reconnect failed — try [C] again"
+        self._cam_reconnecting = False
+
     # ── Drawing ───────────────────────────────────────────────────────────────
 
     def _draw(self, frame: np.ndarray) -> np.ndarray:
@@ -453,8 +496,8 @@ class Eval2GUI:
 
         # Waiting-for-input hint
         if self._waiting_for_input:
-            cv2.putText(frame, "type a-z on host keyboard …", (8, 82),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.46, (255, 200, 60), 1, cv2.LINE_AA)
+            cv2.putText(frame, "type a-z / Space / Enter on host keyboard …", (8, 82),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.40, (255, 200, 60), 1, cv2.LINE_AA)
 
         # Result dots for completed rollouts
         dot_x, dot_y = 8, 100
@@ -483,7 +526,7 @@ class Eval2GUI:
                     cv2.FONT_HERSHEY_SIMPLEX, 0.44, (255, 255, 255), 1, cv2.LINE_AA)
         cv2.putText(
             frame,
-            f",=home  .=KB_home  `=overlay  Esc=quit",
+            f",=home  .=KB_home  `=overlay  C=cam  Esc=quit",
             (8, h - bar_h + 36),
             cv2.FONT_HERSHEY_SIMPLEX, 0.30, (160, 220, 160), 1, cv2.LINE_AA,
         )
@@ -506,11 +549,25 @@ class Eval2GUI:
         self._go_kb_home(then_start=True)
 
         while True:
-            ret, frame = self.cap.read()
-            if not ret:
+            if self._cam_reconnecting:
                 frame = np.zeros((CAMERA_HEIGHT, CAMERA_WIDTH, 3), dtype=np.uint8)
-                cv2.putText(frame, "No camera signal", (60, CAMERA_HEIGHT // 2),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (40, 40, 200), 2)
+                cv2.putText(frame, "Reconnecting camera …", (60, CAMERA_HEIGHT // 2),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (40, 160, 200), 2)
+                ret = False
+            else:
+                ret, frame = self.cap.read()
+                if not ret:
+                    self._cam_fail_count += 1
+                    frame = np.zeros((CAMERA_HEIGHT, CAMERA_WIDTH, 3), dtype=np.uint8)
+                    cv2.putText(frame, "No camera signal", (60, CAMERA_HEIGHT // 2),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (40, 40, 200), 2)
+                    if self._cam_fail_count >= _CAM_RECONNECT_AFTER:
+                        self._cam_fail_count   = 0
+                        self._cam_reconnecting = True
+                        threading.Thread(target=self._reconnect_camera,
+                                         daemon=True).start()
+                else:
+                    self._cam_fail_count = 0
 
             ts = time.monotonic()
             with self._frame_lock:
@@ -530,6 +587,12 @@ class Eval2GUI:
             elif self._waiting_for_input and ord("a") <= ch <= ord("z"):
                 self._input_key = chr(ch)
                 self._input_event.set()
+            elif self._waiting_for_input and ch == 32:   # Space
+                self._input_key = "space"
+                self._input_event.set()
+            elif self._waiting_for_input and ch == 13:   # Enter
+                self._input_key = "enter"
+                self._input_event.set()
             elif ch == ord(","):
                 self._go_home()
             elif ch == ord("."):
@@ -541,6 +604,11 @@ class Eval2GUI:
             elif ch == 96:                     # `
                 self._show_pnp = not self._show_pnp
                 self._status = f"PnP overlay {'ON' if self._show_pnp else 'OFF'}"
+            elif ch == ord("c"):               # C = reconnect camera
+                if not self._cam_reconnecting:
+                    self._cam_reconnecting = True
+                    threading.Thread(target=self._reconnect_camera,
+                                     daemon=True).start()
 
         self._cancel()
         self._det.stop()
@@ -579,7 +647,7 @@ def main() -> None:
     try:
         app.run()
     finally:
-        cap.release()
+        app.cap.release()   # may differ from cap if reconnected during the session
         robot.disconnect()
         print("Disconnected.")
 
