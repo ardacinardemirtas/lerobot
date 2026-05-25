@@ -1,177 +1,136 @@
-<p align="center">
-  <img alt="LeRobot, Hugging Face Robotics Library" src="./media/readme/lerobot-logo-thumbnail.png" width="100%">
-</p>
+# SO-101 Keyboard-Pressing Eval
 
-<div align="center">
+An extension of [LeRobot](https://github.com/huggingface/lerobot) that programs an SO-101 robotic arm to autonomously press keys on a physical keyboard using real-time computer vision.
 
-[![Tests](https://github.com/huggingface/lerobot/actions/workflows/latest_deps_tests.yml/badge.svg?branch=main)](https://github.com/huggingface/lerobot/actions/workflows/latest_deps_tests.yml?query=branch%3Amain)
-[![Tests](https://github.com/huggingface/lerobot/actions/workflows/docker_publish.yml/badge.svg?branch=main)](https://github.com/huggingface/lerobot/actions/workflows/docker_publish.yml?query=branch%3Amain)
-[![Python versions](https://img.shields.io/pypi/pyversions/lerobot)](https://www.python.org/downloads/)
-[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://github.com/huggingface/lerobot/blob/main/LICENSE)
-[![Status](https://img.shields.io/pypi/status/lerobot)](https://pypi.org/project/lerobot/)
-[![Version](https://img.shields.io/pypi/v/lerobot)](https://pypi.org/project/lerobot/)
-[![Contributor Covenant](https://img.shields.io/badge/Contributor%20Covenant-v2.1-ff69b4.svg)](https://github.com/huggingface/lerobot/blob/main/CODE_OF_CONDUCT.md)
-[![Discord](https://img.shields.io/badge/Discord-Join_Us-5865F2?style=flat&logo=discord&logoColor=white)](https://discord.gg/q8Dzzpym3f)
+## System overview
 
-</div>
+| Component | Details |
+|-----------|---------|
+| Robot | SO-101 6-DOF follower arm |
+| Vision | USB camera + Roboflow inference server (keyboard key detection) |
+| Localization | Iterative PnP (`cv2.solvePnP`) to map pixel detections to 3-D key positions |
+| Motion | QP-based inverse kinematics (`move_to_position_qp.py`) |
+| Base library | [LeRobot](https://github.com/huggingface/lerobot) (HuggingFace) |
 
-**LeRobot** aims to provide models, datasets, and tools for real-world robotics in PyTorch. The goal is to lower the barrier to entry so that everyone can contribute to and benefit from shared datasets and pretrained models.
+The robot detects keys in the camera frame, solves for their 3-D position relative to the end-effector, then executes smooth joint-space trajectories to reach and press each key.
 
-🤗 A hardware-agnostic, Python-native interface that standardizes control across diverse platforms, from low-cost arms (SO-100) to humanoids.
+## Eval tasks
 
-🤗 A standardized, scalable LeRobotDataset format (Parquet + MP4 or images) hosted on the Hugging Face Hub, enabling efficient storage, streaming and visualization of massive robotic datasets.
+### Eval 1 — Sequential key press (`eval_keyboard_task1_seq.py`)
+Press **Space → Enter → R → L** in order within **40 seconds**.  
+Scoring: 12.5 pts per correctly pressed key — **50 pts max**.
 
-🤗 State-of-the-art policies that have been shown to transfer to the real-world ready for training and deployment.
+### Eval 2 — Single key on demand (`eval_keyboard_eval2.py`)
+Robot is given a random a–z character and must press it within **10 seconds**.  
+16 rollouts × 3.125 pts — **50 pts max**.
 
-🤗 Comprehensive support for the open-source ecosystem to democratize physical AI.
+### Eval 3 — Sentence typing (`eval_keyboard_eval3.py`)
+Robot types full sentences (a–z + space) from a provided list.  
+10 rollouts, scored by `max(0, 5 − Levenshtein(typed, target))` — **50 pts max**.
 
-## Quick Start
+## Repository layout
 
-LeRobot can be installed directly from PyPI.
-
-```bash
-pip install lerobot
-lerobot-info
+```
+├── eval_keyboard_task1_seq.py   # Eval 1 runner
+├── eval_keyboard_eval2.py       # Eval 2 runner
+├── eval_keyboard_eval3.py       # Eval 3 runner
+├── run_eval_1.sh                # Install + run Eval 1
+├── run_eval_2.sh                # Install + run Eval 2
+├── run_eval_3.sh                # Install + run Eval 3
+├── setup_inference_pc.sh        # One-time environment setup
+├── keyboard_detection/          # Roboflow detection helpers + venv
+├── click_to_move.py             # Camera & robot constants
+├── move_to_position_qp.py       # QP inverse kinematics
+├── press_key_pnp.py             # Key-press primitives (PnP + motion)
+├── keyboard_pnp.py              # PnP overlay utilities
+├── sentences.txt                # Sentences used by Eval 3
+└── src/lerobot/                 # Upstream LeRobot library
 ```
 
-> [!IMPORTANT]
-> For detailed installation guide, please see the [Installation Documentation](https://huggingface.co/docs/lerobot/installation).
+## Setup
 
-## Robots & Control
+### Prerequisites
 
-<div align="center">
-  <img src="./media/readme/robots_control_video.webp" width="640px" alt="Reachy 2 Demo">
-</div>
+- Ubuntu 22.04 or 24.04 (tested); Python 3.12; `uv` (installed automatically if missing)
+- SO-101 arm connected via USB serial
+- USB camera connected (default index 1)
+- [Roboflow](https://roboflow.com) account — you need a **ROBOFLOW_API_KEY**
 
-LeRobot provides a unified `Robot` class interface that decouples control logic from hardware specifics. It supports a wide range of robots and teleoperation devices.
+### One-time environment install
+
+```bash
+# Clone the repo
+git clone <this-repo-url>
+cd lerobot
+
+# Run the setup script (installs lerobot venv + Roboflow inference server)
+bash setup_inference_pc.sh
+
+# Fill in your API key
+nano keyboard_detection/.env.inference   # set ROBOFLOW_API_KEY=...
+```
+
+The setup script will:
+1. Create `.venv` with LeRobot + hardware extras
+2. Create `keyboard_detection/.venv312` with the Roboflow inference CLI
+3. Write a template `keyboard_detection/.env.inference` if one does not exist
+
+### Hardware constants
+
+Open `click_to_move.py` and verify these match your setup:
 
 ```python
-from lerobot.robots.myrobot import MyRobot
-
-# Connect to a robot
-robot = MyRobot(config=...)
-robot.connect()
-
-# Read observation and send action
-obs = robot.get_observation()
-action = model.select_action(obs)
-robot.send_action(action)
+PORT         = "/dev/ttyUSB0"   # SO-101 serial port
+CAMERA_INDEX = 1                # OpenCV camera index
+ROBOT_ID     = "my_so101"      # calibration directory name
 ```
 
-**Supported Hardware:** SO100, LeKiwi, Koch, HopeJR, OMX, EarthRover, Reachy2, Gamepads, Keyboards, Phones, OpenARM, Unitree G1.
+### Calibration
 
-While these devices are natively integrated into the LeRobot codebase, the library is designed to be extensible. You can easily implement the Robot interface to utilize LeRobot's data collection, training, and visualization tools for your own custom robot.
-
-For detailed hardware setup guides, see the [Hardware Documentation](https://huggingface.co/docs/lerobot/integrate_hardware).
-
-## LeRobot Dataset
-
-To solve the data fragmentation problem in robotics, we utilize the **LeRobotDataset** format.
-
-- **Structure:** Synchronized MP4 videos (or images) for vision and Parquet files for state/action data.
-- **HF Hub Integration:** Explore thousands of robotics datasets on the [Hugging Face Hub](https://huggingface.co/lerobot).
-- **Tools:** Seamlessly delete episodes, split by indices/fractions, add/remove features, and merge multiple datasets.
-
-```python
-from lerobot.datasets.lerobot_dataset import LeRobotDataset
-
-# Load a dataset from the Hub
-dataset = LeRobotDataset("lerobot/aloha_mobile_cabinet")
-
-# Access data (automatically handles video decoding)
-episode_index=0
-print(f"{dataset[episode_index]['action'].shape=}\n")
-```
-
-Learn more about it in the [LeRobotDataset Documentation](https://huggingface.co/docs/lerobot/lerobot-dataset-v3)
-
-## SoTA Models
-
-LeRobot implements state-of-the-art policies in pure PyTorch, covering Imitation Learning, Reinforcement Learning, and Vision-Language-Action (VLA) models, with more coming soon. It also provides you with the tools to instrument and inspect your training process.
-
-<p align="center">
-  <img alt="Gr00t Architecture" src="./media/readme/VLA_architecture.jpg" width="640px">
-</p>
-
-Training a policy is as simple as running a script configuration:
+If you have not calibrated the arm yet:
 
 ```bash
-lerobot-train \
-  --policy=act \
-  --dataset.repo_id=lerobot/aloha_mobile_cabinet
+.venv/bin/lerobot-calibrate \
+  --robot.type=so101_follower \
+  --robot.port=/dev/ttyUSB0 \
+  --robot.id=my_so101
 ```
 
-| Category                   | Models                                                                                                                                                                                                                  |
-| -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Imitation Learning**     | [ACT](./docs/source/policy_act_README.md), [Diffusion](./docs/source/policy_diffusion_README.md), [VQ-BeT](./docs/source/policy_vqbet_README.md), [Multitask DiT Policy](./docs/source/policy_multi_task_dit_README.md) |
-| **Reinforcement Learning** | [HIL-SERL](./docs/source/hilserl.mdx), [TDMPC](./docs/source/policy_tdmpc_README.md) & QC-FQL (coming soon)                                                                                                             |
-| **VLAs Models**            | [Pi0Fast](./docs/source/pi0fast.mdx), [Pi0.5](./docs/source/pi05.mdx), [GR00T N1.5](./docs/source/policy_groot_README.md), [SmolVLA](./docs/source/policy_smolvla_README.md), [XVLA](./docs/source/xvla.mdx)            |
+## Running the evals
 
-Similarly to the hardware, you can easily implement your own policy & leverage LeRobot's data collection, training, and visualization tools, and share your model to the HF Hub
-
-For detailed policy setup guides, see the [Policy Documentation](https://huggingface.co/docs/lerobot/bring_your_own_policies).
-
-## Inference & Evaluation
-
-Evaluate your policies in simulation or on real hardware using the unified evaluation script. LeRobot supports standard benchmarks like **LIBERO**, **MetaWorld** and more to come.
+Each script installs the required environment (if not already done) then starts the Roboflow inference server and launches the eval GUI.
 
 ```bash
-# Evaluate a policy on the LIBERO benchmark
-lerobot-eval \
-  --policy.path=lerobot/pi0_libero_finetuned \
-  --env.type=libero \
-  --env.task=libero_object \
-  --eval.n_episodes=10
+bash run_eval_1.sh   # Eval 1 — Space → Enter → R → L
+bash run_eval_2.sh   # Eval 2 — single key on demand
+bash run_eval_3.sh   # Eval 3 — sentence typing
 ```
 
-Learn how to implement your own simulation environment or benchmark and distribute it from the HF Hub by following the [EnvHub Documentation](https://huggingface.co/docs/lerobot/envhub)
+Pass `--sentences <file>` to `run_eval_3.sh` to use a custom sentence list:
 
-## Resources
+```bash
+bash run_eval_3.sh --sentences sentences.txt
+```
 
-- **[Documentation](https://huggingface.co/docs/lerobot/index):** The complete guide to tutorials & API.
-- **[Chinese Tutorials: LeRobot+SO-ARM101中文教程-同济子豪兄](https://zihao-ai.feishu.cn/wiki/space/7589642043471924447)** Detailed doc for assembling, teleoperate, dataset, train, deploy. Verified by Seed Studio and 5 global hackathon players.
-- **[Discord](https://discord.gg/q8Dzzpym3f):** Join the `LeRobot` server to discuss with the community.
-- **[X](https://x.com/LeRobotHF):** Follow us on X to stay up-to-date with the latest developments.
-- **[Robot Learning Tutorial](https://huggingface.co/spaces/lerobot/robot-learning-tutorial):** A free, hands-on course to learn robot learning using LeRobot.
+### In-GUI controls (all evals)
+
+| Key | Action |
+|-----|--------|
+| `.` | Find keyboard home (PnP — do this first) |
+| `s` / `Space` | Start the timed run |
+| `,` or `Home` | Return to reset home |
+| `` ` `` | Toggle PnP overlay |
+| `Esc` | Quit |
 
 ## Citation
 
-If you use LeRobot in your project, please cite the GitHub repository to acknowledge the ongoing development and contributors:
+This project builds on LeRobot:
 
 ```bibtex
 @misc{cadene2024lerobot,
-    author = {Cadene, Remi and Alibert, Simon and Soare, Alexander and Gallouedec, Quentin and Zouitine, Adil and Palma, Steven and Kooijmans, Pepijn and Aractingi, Michel and Shukor, Mustafa and Aubakirova, Dana and Russi, Martino and Capuano, Francesco and Pascal, Caroline and Choghari, Jade and Moss, Jess and Wolf, Thomas},
-    title = {LeRobot: State-of-the-art Machine Learning for Real-World Robotics in Pytorch},
-    howpublished = "\url{https://github.com/huggingface/lerobot}",
-    year = {2024}
+    author = {Cadene, Remi and Alibert, Simon and Soare, Alexander and others},
+    title  = {LeRobot: State-of-the-art Machine Learning for Real-World Robotics in Pytorch},
+    year   = {2024},
+    url    = {https://github.com/huggingface/lerobot}
 }
 ```
-
-If you are referencing our research or the academic paper, please also cite our ICLR publication:
-
-<details>
-<summary><b>ICLR 2026 Paper</b></summary>
-
-```bibtex
-@inproceedings{cadenelerobot,
-  title={LeRobot: An Open-Source Library for End-to-End Robot Learning},
-  author={Cadene, Remi and Alibert, Simon and Capuano, Francesco and Aractingi, Michel and Zouitine, Adil and Kooijmans, Pepijn and Choghari, Jade and Russi, Martino and Pascal, Caroline and Palma, Steven and Shukor, Mustafa and Moss, Jess and Soare, Alexander and Aubakirova, Dana and Lhoest, Quentin and Gallou\'edec, Quentin and Wolf, Thomas},
-  booktitle={The Fourteenth International Conference on Learning Representations},
-  year={2026},
-  url={https://arxiv.org/abs/2602.22818}
-}
-```
-
-</details>
-
-## Contribute
-
-We welcome contributions from everyone in the community! To get started, please read our [CONTRIBUTING.md](https://github.com/huggingface/lerobot/blob/main/CONTRIBUTING.md) guide. Whether you're adding a new feature, improving documentation, or fixing a bug, your help and feedback are invaluable. We're incredibly excited about the future of open-source robotics and can't wait to work with you on what's next—thank you for your support!
-
-<p align="center">
-  <img alt="SO101 Video" src="./media/readme/so100_video.webp" width="640px">
-</p>
-
-<div align="center">
-<sub>Built by the <a href="https://huggingface.co/lerobot">LeRobot</a> team at <a href="https://huggingface.co">Hugging Face</a> with ❤️</sub>
-</div>
