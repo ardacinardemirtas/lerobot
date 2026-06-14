@@ -60,7 +60,7 @@ Robot types full sentences (a–z + space) from a provided list.
 
 ```bash
 # Clone the repo
-git clone <this-repo-url>
+git clone https://github.com/ardacinardemirtas/lerobot.git
 cd lerobot
 
 # Run the setup script (installs lerobot venv + Roboflow inference server)
