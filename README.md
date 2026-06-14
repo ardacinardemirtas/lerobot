@@ -14,6 +14,13 @@ An extension of [LeRobot](https://github.com/huggingface/lerobot) that programs 
 
 The robot detects keys in the camera frame, solves for their 3-D position relative to the end-effector, then executes smooth joint-space trajectories to reach and press each key.
 
+## How it works
+
+1. **Detection** — A Roboflow inference server runs locally and returns bounding boxes for each key visible in the camera frame.
+2. **Localization (PnP)** — `cv2.solvePnP` maps the pixel detections to 3-D key positions in the robot's base frame using a known physical key layout and the hand-eye transform `T_EE_CAM` calibrated offline.
+3. **Two-step press** — The arm first hovers above the target key (coarse), detects again from the closer vantage (fine refinement), then drives the tip through the key surface and lifts back.
+4. **IK** — `move_to_position_qp.py` solves joint angles via quadratic programming with joint-limit and workspace constraints, then interpolates a smooth trajectory at 30 Hz.
+
 ## Eval tasks
 
 ### Eval 1 — Sequential key press (`eval_keyboard_task1_seq.py`)
@@ -59,14 +66,15 @@ Robot types full sentences (a–z + space) from a provided list.
 ### One-time environment install
 
 ```bash
-# Clone the repo
-git clone https://github.com/ardacinardemirtas/lerobot.git
+# Clone the repo (--recurse-submodules pulls the keyboard_detection submodule)
+git clone --recurse-submodules https://github.com/ardacinardemirtas/lerobot.git
 cd lerobot
 
 # Run the setup script (installs lerobot venv + Roboflow inference server)
 bash setup_inference_pc.sh
 
 # Fill in your API key
+cp keyboard_detection/.env.inference.example keyboard_detection/.env.inference
 nano keyboard_detection/.env.inference   # set ROBOFLOW_API_KEY=...
 ```
 
@@ -75,15 +83,20 @@ The setup script will:
 2. Create `keyboard_detection/.venv312` with the Roboflow inference CLI
 3. Write a template `keyboard_detection/.env.inference` if one does not exist
 
+> **Already cloned without `--recurse-submodules`?** Run:
+> `git submodule update --init --recursive`
+
 ### Hardware constants
 
 Open `click_to_move.py` and verify these match your setup:
 
 ```python
-PORT         = "/dev/ttyUSB0"   # SO-101 serial port
-CAMERA_INDEX = 1                # OpenCV camera index
-ROBOT_ID     = "my_so101"      # calibration directory name
+PORT         = "/dev/ttyUSB0"   # SO-101 serial port (use ls /dev/ttyUSB* to find yours)
+CAMERA_INDEX = 1                # OpenCV camera index (use lerobot-find-cameras to find yours)
+ROBOT_ID     = "my_so101"      # must match the --robot.id used during calibration
 ```
+
+`T_EE_CAM`, `CAMERA_K`, and `DIST_COEFFS` encode the hand-eye and intrinsic calibration for **this specific camera/mount**. If you change the camera position relative to the end-effector you must re-run `solve_hand_eye.py` and update these values.
 
 ### Calibration
 

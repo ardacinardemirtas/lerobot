@@ -32,10 +32,10 @@ from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 
-PORT            = "COM5"
-ROBOT_ID        = "my_awesome_follower_arm"
-CALIBRATION_DIR = Path(r"C:\Users\plata\robots")
-URDF_PATH       = r"C:\Users\plata\robots\lerobot\calibration\so101_new_calib.urdf"
+PORT            = "/dev/ttyUSB0"
+ROBOT_ID        = "my_so101"
+CALIBRATION_DIR = Path(__file__).parent.parent
+URDF_PATH       = str(Path(__file__).parent / "calibration" / "so101_new_calib.urdf")
 FPS             = 30
 
 ARM_JOINTS  = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll"]
